@@ -1,0 +1,37 @@
+# BEAM-asr corpus study manifest.
+# 30 files, one representative "central" module per OTP application,
+# pinned to the locally cloned Erlang/OTP 28.5 shallow clone (see
+# README.md for the exact commit). Selected as the canonical/most-
+# central module of each application (not cherry-picked for expected
+# ASR hits) to keep domain coverage representative rather than biased.
+# Format: <path relative to Erlang-OTP/lib> <domain tag>
+kernel/src/file.erl kernel-io
+stdlib/src/lists.erl stdlib-lists
+stdlib/src/string.erl stdlib-strings
+stdlib/src/gen_server.erl stdlib-otp-behavior
+stdlib/src/maps.erl stdlib-maps
+stdlib/src/digraph.erl stdlib-graphs
+compiler/src/v3_core.erl compiler
+crypto/src/crypto.erl crypto
+ssl/src/ssl.erl ssl-tls
+public_key/src/public_key.erl public-key-crypto
+ssh/src/ssh.erl ssh-protocol
+mnesia/src/mnesia.erl database
+xmerl/src/xmerl_scan.erl xml-parsing
+inets/src/http_client/httpc.erl http-client
+asn1/src/asn1ct.erl asn1-encoding
+diameter/src/base/diameter.erl telecom-protocol
+megaco/src/engine/megaco_config.erl telecom-protocol
+snmp/src/agent/snmpa.erl network-management
+dialyzer/src/dialyzer.erl static-analysis
+syntax_tools/src/erl_syntax.erl ast-tooling
+tools/src/cover.erl code-coverage
+observer/src/etop.erl monitoring
+runtime_tools/src/dbg.erl tracing
+sasl/src/release_handler.erl release-management
+parsetools/src/yecc.erl parser-generator
+eunit/src/eunit.erl testing-framework
+common_test/src/ct.erl testing-framework
+debugger/src/dbg_ieval.erl interpreter
+edoc/src/edoc.erl documentation-generator
+reltool/src/reltool.erl release-management
