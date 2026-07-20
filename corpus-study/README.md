@@ -8,7 +8,7 @@ study (`../../FOL/fol/docs/cgo2027/corpus-study/`) and cpython-asr's
 (`../../cpython-asr/corpus-study/`): a syntactic-shape Pass 1 (an
 upper-bound proxy) followed by a gate-faithful Pass 2 that runs the
 *real* `asr_transform.erl` as a black-box oracle, never a
-re-implementation that could drift from the actual v1–v1.5 rules.
+re-implementation that could drift from the actual v1–v1.6 rules.
 
 **Update (v1.4)**: this study's own Category A and Category B findings
 (below) were fed back into `asr_transform.erl` as two targeted fixes —
@@ -119,19 +119,21 @@ Total LOC: 83,457 (83.46 KLOC)
 Tail-self-recursive functions (loop sites, unique): 345
 Candidate positions by kind: record_strong=10  record_weak=31  map=0  collection=0  scalar=0  other=0
 Record-shaped (strong+weak) positions: 41
-Gate-faithful qualification: qualified=2  declined=39  unknown=0
+Gate-faithful qualification: qualified=6  declined=35  unknown=0
 ```
 
 **Headline density**: 41 record-shaped candidate positions across 345
 loop sites (11.9% of loop sites have at least one record-shaped
 position) and 83.46 KLOC (0.49 candidate positions per KLOC).
-Under the original v1–v1.3 transform, **0 of 41 (0%) qualified**; after
-the Category A/B fixes below shipped as v1.4, **2 of 41 (4.9%) now
-qualify** — `digraph:set_type/2` and `httpc:header_record/4`. The
-honest bracket, mirroring FOL/cpython-asr's own framing: *at most*
-11.9% of loop sites are record-accumulator-shaped by syntax; *at least*
-4.9% (measured, not estimated) are actually ASR-addressable in this
-corpus as written, up from 0% before v1.4.
+Under the original v1–v1.3 transform, **0 of 41 (0%) qualified**; v1.4's
+Category A/B fixes brought that to **2 of 41 (4.9%)**; v1.6's three
+further fixes (below) bring it to **6 of 41 (14.6%)** —
+`digraph:set_type/2`, `httpc:header_record/4`, `httpc:validate_headers/3`,
+`xmerl_scan:xml_vsn/4`, `xmerl_scan:scan_system_literal/4`, and
+`xmerl_scan:strip/3`. The honest bracket, mirroring FOL/cpython-asr's
+own framing: *at most* 11.9% of loop sites are record-accumulator-shaped
+by syntax; *at least* 14.6% (measured, not estimated) are actually
+ASR-addressable in this corpus as written, up from 0% before v1.4.
 
 ### Per-file / per-domain breakdown
 
@@ -149,8 +151,8 @@ corpus as written, up from 0% before v1.4.
 | public_key/src/public_key.erl | public-key-crypto | 3.34 | 20 | 0 | 4 | 0 |
 | ssh/src/ssh.erl | ssh-protocol | 1.39 | 2 | 0 | 1 | 0 |
 | mnesia/src/mnesia.erl | database | 5.31 | 15 | 0 | 5 | 0 |
-| xmerl/src/xmerl_scan.erl | xml-parsing | 4.38 | 39 | 7 | 2 | 0 |
-| inets/src/http_client/httpc.erl | http-client | 2.04 | 7 | 2 | 1 | 1 |
+| xmerl/src/xmerl_scan.erl | xml-parsing | 4.38 | 39 | 7 | 2 | 3 |
+| inets/src/http_client/httpc.erl | http-client | 2.04 | 7 | 2 | 1 | 2 |
 | asn1/src/asn1ct.erl | asn1-encoding | 2.33 | 17 | 0 | 0 | — |
 | diameter/src/base/diameter.erl | telecom-protocol | 2.08 | 0 | 0 | 0 | — |
 | megaco/src/engine/megaco_config.erl | telecom-protocol | 2.19 | 4 | 0 | 0 | — |
@@ -230,33 +232,66 @@ two more fixable shapes, both implemented in v1.5:
 
 Both are verified correct in isolation: `fixture_alias_pattern.erl`/
 `fixture_hoisted_binding.erl` (positive, arity-change + runtime-equality
-checked) and `fixture_alias_pattern_literal_declines.erl`/
+checked) and `fixture_alias_nested_declines.erl`/
 `fixture_hoisted_binding_escapes_declines.erl` (negative boundary
-cases) in `../test/`.
+cases) in `../test/`. (The literal-sub-pattern boundary fixture from
+this era was later repurposed into `fixture_alias_guard.erl` once v1.6
+made that shape qualify - see below.)
 
-**Re-running this study against v1.5 still shows 2 of 41 qualifying —
+**Re-running this study against v1.5 still showed 2 of 41 qualifying —
 the same 2 as v1.4.** Re-diagnosing each of the 8 sites above against
-the real (fixed) transform shows why: every one hits a *second*,
+the real (fixed) transform showed why: every one hit a *second*,
 independent blocker in some other clause of the same function, once
 the alias-pattern or hoisting blocker was cleared:
 
-| Site | Second blocker | Detail |
+| Site | Second blocker (at v1.5) | Detail |
 |---|---|---|
-| `xml_vsn/4` | Intra-clause `case` (pre-existing, documented v1 limitation) | Its last clause's body is a bare `case ... end`, not a literal tail call, so it's classified as a base clause; inside that case, the accumulator is used bare twice (once in the untaken branch's `?fatal(...,S)`), exceeding the one-bare-occurrence budget. Nothing to do with Category D. |
-| `strip/3` | Category E — indirect entry construction (not implemented) | `strip/2`'s own body is `strip(Str,S,all)` — an entry call to `strip/3` where the record arrives as an already-bound variable, not a literal `#rec{...}` at the call site. `check_full_construction` can't see through that (flagged as future work when Category D/E/F were first identified; only D and F were in scope this round). |
-| `fetch_DTD/2` | A separate clause with genuinely multiple bare accumulator uses | `fetch_DTD/2`'s third clause passes the accumulator bare into `fetch_and_parse/3` inside a `case`, more than once across its branches — unrelated to the alias-pattern clause Category D fixed. |
-| `scan_comment1/5`, `initial_state/2`, `scan_entity_value/7` | Accumulator passed bare to an opaque helper (interprocedural, out of scope) | E.g. `initial_state/2`: `S1 = event_state(ES, S#xmerl_scanner{event_fun=F}), initial_state(T, S1)` — `event_state/2` receives the accumulator as an extra argument alongside other data; verifying it doesn't leak/misuse it would need real interprocedural purity analysis, well beyond the "one pure reconstruction, one hop" scope Category F's narrow slice deliberately kept to. |
-| `validate_headers/3`, `get_options/2` | Category D's own literal-sub-pattern boundary (by design) | `validate_headers/3`'s recursive clause pattern is `RequestHeaders=#http_request_h{host=undefined}` — a literal, not a plain-var binding, so it's correctly outside the narrow D slice (the harder "per-clause field pattern" variant would be needed, not attempted here). |
+| `xml_vsn/4` | Intra-clause `case` counted the update-expr's own base as a false bare use | Its last clause's body is a bare `case ... end`, not a literal tail call, so it's classified as a base clause; inside that case, `collect_var_uses` didn't yet recognize `S#xmerl_scanner{...}` as a safe touch of S wherever it appeared, so it was double-counted as bare alongside the untaken branch's `?fatal(...,S)` — 2 bare uses, over budget. **Resolved in v1.6, see below.** |
+| `strip/3` | Category E — indirect entry construction (not yet implemented) | `strip/2`'s own body is `strip(Str,S,all)` — an entry call to `strip/3` where the record arrives as an already-bound variable, not a literal `#rec{...}` at the call site. **Resolved in v1.6, see below.** |
+| `fetch_DTD/2` | A separate clause with genuinely multiple bare accumulator uses | `fetch_DTD/2`'s third clause passes the accumulator bare into `fetch_and_parse/3` inside a `case`, more than once across its branches — unrelated to the alias-pattern clause Category D fixed. **Still declines** — a real multi-bare-use, not any of the shapes v1.6 targeted. |
+| `scan_comment1/5`, `initial_state/2`, `scan_entity_value/7` | Accumulator passed bare to an opaque helper (interprocedural, out of scope) | E.g. `initial_state/2`: `S1 = event_state(ES, S#xmerl_scanner{event_fun=F}), initial_state(T, S1)` — `event_state/2` receives the accumulator as an extra argument alongside other data; verifying it doesn't leak/misuse it would need real interprocedural purity analysis, well beyond the "one pure reconstruction, one hop" scope Category F's narrow slice deliberately kept to. **Still declines** — deliberately out of scope for v1.6 too. |
+| `validate_headers/3` | Category D's own literal-sub-pattern boundary (by design) | Its recursive clause pattern is `RequestHeaders=#http_request_h{host=undefined}` — a literal, not a plain-var binding, so it was correctly outside the narrow D slice. **Resolved in v1.6, see below.** |
+| `get_options/2` | Not actually a record loop at all | Re-checked directly: its only "record_weak" clause is `get_options(all=_Options, Profile) -> get_options(get_options(), Profile)` — a special-atom-to-real-value redirect, structurally identical to `sleep({hours,H}) -> sleep(...)`. This was Category C scanner noise misfiled among the record_strong-adjacent group, not a genuine Category D/F candidate — no fix applies or should. |
 
-None of this is a defect in the v1.5 implementation — each mechanism
-does exactly what it was designed to do, confirmed by dedicated
-fixtures. It's a genuine finding about this corpus: real OTP functions
+None of this was a defect in the v1.5 implementation — each mechanism
+did exactly what it was designed to do, confirmed by dedicated
+fixtures. It was a genuine finding about this corpus: real OTP functions
 this size (7–40 clauses) tend to accumulate more than one
 qualification-blocking idiom at once, so a single targeted fix rarely
-flips a whole function on its own. Category E (indirect entry
-construction) and full interprocedural helper-call tracing remain
-unimplemented and are the more likely next source of real movement in
-this specific corpus's numbers.
+flips a whole function on its own. Three of the sites above were
+resolved by the v1.6 fixes below; two remain out of scope by design.
+
+## v1.6: three more fixes, six of eight sites resolved
+
+Following the "second blocker" table above, three targeted fixes closed
+every remaining gap except the two genuinely out-of-scope ones
+(`fetch_DTD/2`'s real multi-bare-use, and the interprocedural
+opaque-helper cases):
+
+| Fix | Shape | Change |
+|---|---|---|
+| **Update-expression transparency** | `collect_var_uses` didn't recognize `Var#rec{field=Expr}` as a safe touch of `Var` anywhere except when `classify_recursive` manually destructured it at the exact tail-call position - everywhere else (a `case` branch, a base-clause return) its own base object was miscounted as bare. | `collect_var_uses/3` now recognizes the update-expression shape directly and recurses only into its field-value expressions, wherever it appears. |
+| **Category D full slice: guard-conversion** | A ground literal/nested alias sub-pattern with no wildcards or variable bindings inside it (e.g. `#http_request_h{host=undefined}`) acts as an implicit guard - the narrow v1.5 slice declined on anything beyond a wildcard or plain-var binding. | The field still gets its ordinary scalar pattern var (unchanged pattern-splicing); a guard `ScalarVar =:= Literal` is appended instead. `=:=` performs deep structural equality, so this covers any ground nested pattern, not just flat atoms. |
+| **Category E: indirect entry construction** | An entry call's accumulator argument is a bare variable (e.g. a wrapper function's own parameter, forwarded through) or an update expression - neither is a literal `#rec{...}` at the call site, which `check_full_construction` required. | Accepts both shapes: a bare variable gets one field-read expression spliced in per field (`Var#rec.field`); an update expression uses its own explicit overrides and reads every other field the same way. Both rely on the same guarantee the original program already needed - if the value isn't actually shaped like the record at runtime, it's a loud `badrecord`, not silent miscompilation. |
+
+Verified in isolation via 7 new fixtures in `../test/`: positive/negative
+pairs for each shape, plus a base-clause-vs-recursive-clause split for
+the update-expression fix and a bare-var-vs-update-expression split for
+Category E.
+
+**Re-running this study against v1.6 now shows 6 of 41 qualifying** —
+`digraph:set_type/2`, `httpc:header_record/4` (from v1.4), plus
+`httpc:validate_headers/3`, `xmerl_scan:xml_vsn/4`,
+`xmerl_scan:scan_system_literal/4`, and `xmerl_scan:strip/3` (new in
+v1.6). All three v1.6 fixes were needed together, not any single one
+alone: `xml_vsn/4` needed the update-expression fix; `validate_headers/3`
+needed both the update-expression fix (its second clause) *and*
+guard-conversion (its first clause); `strip/3` and `scan_system_literal/4`
+needed Category E's bare-variable shape, and `xml_vsn/4` additionally
+needed Category E's update-expression shape at its own entry call
+(`scan_xml_vsn/2`'s `xml_vsn(T, S#xmerl_scanner{col=S#xmerl_scanner.col+1}, H, [])`) -
+discovered only once the update-expression-transparency fix got far
+enough to expose it as the *next* blocker.
 
 ## Honest caveats
 
@@ -285,7 +320,7 @@ this specific corpus's numbers.
   exactly as they'd run in production — a candidate declining here is a
   genuine decline under the current shipped rules, not an artifact of a
   simplified study-only checker.
-- **4.9% qualifying in this specific corpus (up from 0% pre-v1.4)
+- **14.6% qualifying in this specific corpus (up from 0% pre-v1.4)
   should not be read as "ASR now handles most real Erlang code"** — the
   benchmarks (`../benchmarks/`) demonstrate ASR provides genuine
   1.0x-1.79x wins on the exact reconstruct-a-fresh-record-each-iteration
@@ -293,12 +328,18 @@ this specific corpus's numbers.
   than that: real OTP library code's record-accumulator loops were
   overwhelmingly *not* shaped like FOL's own motivating benchmark
   pattern (an accumulator freshly constructed right at the loop's own
-  entry point) - they were either threaded in from a caller that
-  constructed the value elsewhere (category A, now fixed), piped into a
-  continuation rather than returned (category B, now fixed as a shape
-  but only 1 of 8 sampled sites flipped), or not record loops at all
-  once you look past the syntax (category C, unfixable because
-  unrelated). That's a real, actionable finding about where the
-  mechanism's applicability boundary sits and how narrowly a targeted
-  analysis-gap fix moves it, not a verdict on its usefulness — nor a
-  claim that the boundary is now solved.
+  entry point) - they were threaded in from a caller that constructed
+  the value elsewhere (category A / Category E, now fixed), piped into a
+  continuation rather than returned (category B, now fixed as a shape),
+  destructured via a head-alias pattern or a ground-literal guard
+  (category D, now fixed), reconstructed through an intermediate
+  binding or an update expression the analysis couldn't see through yet
+  (category F / the v1.6 transparency fix, now fixed), passed bare into
+  a genuinely opaque helper (still out of scope - would need real
+  interprocedural purity analysis), or not record loops at all once you
+  look past the syntax (category C, unfixable because unrelated). Six
+  fixes across three releases (v1.4-v1.6) moved this corpus from 0% to
+  14.6% qualifying; each fix closed a real, distinct gap, but real OTP
+  functions this size routinely stack more than one such gap in the same
+  function, so progress here is incremental by nature, not a single
+  "solve applicability" moment.

@@ -61,6 +61,40 @@ hoisted_binding_test() ->
     ?assertEqual(fixture_hoisted_binding:run(500), fixture_hoisted_binding_asr:run(500)),
     assert_qualified(fixture_hoisted_binding, loop, 3, 4).
 
+%% Update-expression transparency (v1.6): a base clause whose whole body
+%% is a case expression, using the accumulator bare in one branch and as
+%% an update expression's own base in another - mirrors xmerl_scan.erl's
+%% xml_vsn/4 and httpc.erl's validate_headers/3.
+case_wrapped_base_test() ->
+    ?assertEqual(fixture_case_wrapped_base:run(500), fixture_case_wrapped_base_asr:run(500)),
+    assert_qualified(fixture_case_wrapped_base, loop, 3, 4).
+
+%% Guard-converted alias field (v1.6, Category D full slice): a ground
+%% literal sub-pattern with no wildcards or variable bindings anywhere
+%% inside it (`#pt{tag=fixed}`) converts to an ordinary scalar pattern
+%% var plus an added `=:=` guard - mirrors httpc.erl's
+%% `RequestHeaders = #http_request_h{host=undefined}`.
+alias_guard_test() ->
+    ?assertEqual(fixture_alias_guard:run(500), fixture_alias_guard_asr:run(500)),
+    assert_qualified(fixture_alias_guard, loop, 3, 5).
+
+%% Indirect entry construction (v1.6, Category E): the entry call's
+%% accumulator argument is a bare variable - here wrapper/2's own
+%% parameter, forwarded through - rather than a literal construction at
+%% the call site. Mirrors xmerl_scan.erl's `strip/2 -> strip/3` and
+%% `scan_system_literal/2 -> scan_system_literal/4`.
+indirect_entry_test() ->
+    ?assertEqual(fixture_indirect_entry:run(500), fixture_indirect_entry_asr:run(500)),
+    assert_qualified(fixture_indirect_entry, loop, 3, 4).
+
+%% Indirect entry construction, update-expression shape (v1.6, Category
+%% E): the entry call's accumulator argument is an update expression,
+%% not a bare variable or literal construction - mirrors xmerl_scan.erl's
+%% `scan_xml_vsn/2 -> xml_vsn(T, S#xmerl_scanner{col=...}, H, [])`.
+indirect_entry_update_test() ->
+    ?assertEqual(fixture_indirect_entry_update:run(500), fixture_indirect_entry_update_asr:run(500)),
+    assert_qualified(fixture_indirect_entry_update, loop, 3, 4).
+
 %% Interprocedural inlining (v1.1): the reconstruction lives in a
 %% separate one-level-inlinable helper function, not literally in the
 %% tail call's own argument.
@@ -139,15 +173,20 @@ base_double_bare_declines_test() ->
     ?assertEqual({{pt, 500.0, 1000.0}, {pt, 500.0, 1000.0}}, R),
     assert_declined(fixture_base_double_bare).
 
-alias_pattern_literal_declines_test() ->
-    R = fixture_alias_pattern_literal_declines:run(500),
-    ?assertEqual({pt, 500.0, 1000.0, fixed}, R),
-    assert_declined(fixture_alias_pattern_literal_declines).
+alias_nested_declines_test() ->
+    R = fixture_alias_nested_declines:run(500),
+    ?assertEqual({pt, 500.0, 1000.0, {external, {entity, foo}}}, R),
+    assert_declined(fixture_alias_nested_declines).
 
 hoisted_binding_escapes_declines_test() ->
     R = fixture_hoisted_binding_escapes_declines:run(500),
     ?assertEqual({pt, 500.0, 1000.0}, R),
     assert_declined(fixture_hoisted_binding_escapes_declines).
+
+indirect_entry_expr_declines_test() ->
+    R = fixture_indirect_entry_expr_declines:run(500),
+    ?assertEqual({pt, 500.0, 1000.0}, R),
+    assert_declined(fixture_indirect_entry_expr_declines).
 
 %% ---------------------------------------------------------------------
 %% Helpers

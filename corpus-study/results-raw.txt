@@ -13,8 +13,8 @@ ssl/src/ssl.erl                               ssl-tls                3936 3 0 0 
 public_key/src/public_key.erl                 public-key-crypto      3337 20 0 4 0 0 0
 ssh/src/ssh.erl                               ssh-protocol           1387 2 0 1 0 0 0
 mnesia/src/mnesia.erl                         database               5311 15 0 5 0 0 0
-xmerl/src/xmerl_scan.erl                      xml-parsing            4382 39 7 2 0 0 0
-inets/src/http_client/httpc.erl               http-client            2035 7 2 1 0 0 1
+xmerl/src/xmerl_scan.erl                      xml-parsing            4382 39 7 2 0 0 3
+inets/src/http_client/httpc.erl               http-client            2035 7 2 1 0 0 2
 asn1/src/asn1ct.erl                           asn1-encoding          2325 17 0 0 0 0 0
 diameter/src/base/diameter.erl                telecom-protocol       2083 0 0 0 0 0 0
 megaco/src/engine/megaco_config.erl           telecom-protocol       2190 4 0 0 0 0 0
@@ -38,7 +38,7 @@ Total LOC: 83457 (83.46 KLOC)
 Tail-self-recursive functions (loop sites, unique): 345
 Candidate positions by kind: record_strong=10 record_weak=31 map=0 collection=0 scalar=0 other=0
 Record-shaped (strong+weak) positions: 41
-Gate-faithful qualification: qualified=2 declined=39 unknown=0
+Gate-faithful qualification: qualified=6 declined=35 unknown=0
 
 === Record-shaped candidate detail (for manual false-positive review) ===
 kernel/src/file.erl :: open/2 pos=2 kind=record_weak recursive_clauses=1/2 -> false
@@ -68,17 +68,17 @@ mnesia/src/mnesia.erl :: add_match/3 pos=2 kind=record_weak recursive_clauses=4/
 mnesia/src/mnesia.erl :: add_ix_match/5 pos=2 kind=record_weak recursive_clauses=1/6 -> false
 mnesia/src/mnesia.erl :: qlc_select/1 pos=1 kind=record_weak recursive_clauses=1/3 -> false
 xmerl/src/xmerl_scan.erl :: initial_state/2 pos=2 kind=record_strong recursive_clauses=29/31 -> false
-xmerl/src/xmerl_scan.erl :: xml_vsn/4 pos=2 kind=record_strong recursive_clauses=3/6 -> false
+xmerl/src/xmerl_scan.erl :: xml_vsn/4 pos=2 kind=record_strong recursive_clauses=3/6 -> true
 xmerl/src/xmerl_scan.erl :: fetch_DTD/2 pos=2 kind=record_strong recursive_clauses=1/3 -> false
-xmerl/src/xmerl_scan.erl :: scan_system_literal/4 pos=2 kind=record_strong recursive_clauses=1/4 -> false
+xmerl/src/xmerl_scan.erl :: scan_system_literal/4 pos=2 kind=record_strong recursive_clauses=1/4 -> true
 xmerl/src/xmerl_scan.erl :: scan_entity_value/7 pos=2 kind=record_strong recursive_clauses=15/26 -> false
 xmerl/src/xmerl_scan.erl :: scan_entity_value/7 pos=7 kind=record_weak recursive_clauses=15/26 -> false
 xmerl/src/xmerl_scan.erl :: scan_comment1/5 pos=2 kind=record_strong recursive_clauses=4/7 -> false
-xmerl/src/xmerl_scan.erl :: strip/3 pos=2 kind=record_strong recursive_clauses=5/8 -> false
+xmerl/src/xmerl_scan.erl :: strip/3 pos=2 kind=record_strong recursive_clauses=5/8 -> true
 xmerl/src/xmerl_scan.erl :: accumulate_whitespace/5 pos=4 kind=record_weak recursive_clauses=5/7 -> false
 inets/src/http_client/httpc.erl :: get_options/2 pos=1 kind=record_weak recursive_clauses=1/2 -> false
 inets/src/http_client/httpc.erl :: header_record/4 pos=2 kind=record_strong recursive_clauses=39/40 -> true
-inets/src/http_client/httpc.erl :: validate_headers/3 pos=1 kind=record_strong recursive_clauses=1/3 -> false
+inets/src/http_client/httpc.erl :: validate_headers/3 pos=1 kind=record_strong recursive_clauses=1/3 -> true
 syntax_tools/src/erl_syntax.erl :: revert_forms/1 pos=1 kind=record_weak recursive_clauses=1/2 -> false
 common_test/src/ct.erl :: sleep/1 pos=1 kind=record_weak recursive_clauses=3/4 -> false
 debugger/src/dbg_ieval.erl :: eval_list_1/5 pos=4 kind=record_weak recursive_clauses=1/2 -> false

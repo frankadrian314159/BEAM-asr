@@ -27,7 +27,7 @@ its next *fully-qualified* (`Mod:F(...)`) call, so a self-recursive
 module docstring in `src/asr_transform.erl` and the design notes
 referenced from the commit history for the full reasoning.
 
-## Status: v1 + v1.1 (interprocedural inlining) + v1.2 (multi-accumulator) + v1.3 (branch-shaped reconstruction) + v1.4 (record field defaults, base-case continuation handoff) + v1.5 (head-alias patterns, hoisted intermediate bindings)
+## Status: v1 + v1.1 (interprocedural inlining) + v1.2 (multi-accumulator) + v1.3 (branch-shaped reconstruction) + v1.4 (record field defaults, base-case continuation handoff) + v1.5 (head-alias patterns, hoisted intermediate bindings) + v1.6 (update-expression transparency, guard-converted alias fields, indirect entry construction)
 
 | Concept | This port |
 |---|---|
@@ -41,34 +41,38 @@ referenced from the commit history for the full reasoning.
 | Record field defaults (v1.4, corpus-study Category A) | `collect_record_defaults/1` resolves every field's declared (or Erlang's own implicit `undefined`) default; `check_full_construction/5` accepts an entry call that omits a field with a default instead of requiring every field named explicitly; `field_expr_or_default/3` supplies it at rewrite time |
 | Base-case continuation handoff (v1.4, corpus-study Category B) | `classify_base/7` allows the accumulator's one remaining bare occurrence anywhere in the clause (guard or body, not just trailing position) - `subst_bare_return/5` was already a fully generic tree walk that re-boxes wherever it finds that occurrence, so no rewrite-side change was needed, only the qualification-time restriction was removed |
 
-| Head-alias pattern (v1.5, corpus-study Category D, narrow slice) | `extract_accum_pat/1` also recognizes `Var=#rec{field=SubVar,...}` as a clause's own accumulator pattern, not just a bare variable - every field sub-pattern must be a wildcard or a fresh plain-variable binding (a literal sub-pattern, e.g. an implicit-guard constant match, stays out of scope and still declines); `alias_rename_map/2` renames each alias variable to the same scalar name an ordinary field read would use |
+| Head-alias pattern (v1.5, corpus-study Category D, narrow slice) | `extract_accum_pat/1` also recognizes `Var=#rec{field=SubVar,...}` as a clause's own accumulator pattern, not just a bare variable - every field sub-pattern must be a wildcard or a fresh plain-variable binding (a literal sub-pattern, e.g. an implicit-guard constant match, stayed out of scope through v1.5 - see v1.6 below); `alias_rename_map/2` renames each alias variable to the same scalar name an ordinary field read would use |
 | Hoisted intermediate binding (v1.5, corpus-study Category F, narrow slice) | `try_hoist_single_binding/4` splices a single-use `Vk = VName#rec{...}` statement directly into the tail call's own argument position before the rest of qualification runs, so every later check operates exactly as if that reconstruction had been written at the call site directly - a chain of length exactly one; a helper call anywhere in the chain is out of scope (would need real interprocedural purity analysis, well beyond `try_inline/3`'s own narrow one-hop scope) |
+| Update-expression transparency (v1.6) | `collect_var_uses/3` now recognizes `Var#rec{field=Expr}` as a safe touch of `Var` wherever it appears (recursing only into the field-value expressions), not just when `classify_recursive` manually destructures it at the exact tail-call position - previously any other occurrence (a `case` branch, a base-clause return) had its own base object miscounted as a bare use |
+| Guard-converted alias field (v1.6, corpus-study Category D full slice) | A ground alias sub-pattern with no wildcards or variable bindings anywhere inside it (e.g. `#rec{tag=fixed}`, or any fully-literal nested tuple) now converts to an ordinary scalar pattern var (unchanged pattern-splicing) plus an added `ScalarVar =:= Literal` guard, instead of declining - `is_ground_pattern/1` classifies the sub-pattern, `guard_constraint_expr/2` builds the guard, `append_guard_conjuncts/2` ANDs it into every existing guard disjunct |
+| Indirect entry construction (v1.6, corpus-study Category E) | `check_full_construction/5` now also accepts an entry call's accumulator argument being a bare variable (e.g. a wrapper function's own parameter, forwarded through) or an update expression, not just a literal `#rec{...}`; `splice_entry_args/3` reads each field directly off the variable (`Var#rec.field`) for the bare case, or uses the explicit override plus a field read for every other field in the update-expression case - both rely on the same guarantee the original program already needed at that call site |
 
-Both v1.4 fixes were motivated directly by `corpus-study/README.md`'s
-hand-audited false-positive categories against real Erlang/OTP code
-(`digraph:set_type/2`, `httpc:header_record/4`); the v1.5 fixes came
-from the same report's follow-on analysis - see that report for the
-full before/after qualification numbers, including why v1.5 verifiably
-works (dedicated fixtures) but didn't move this specific corpus's
-qualifying count, since every candidate it was expected to help turned
-out to hit a second, independent blocker in some other clause of the
-same function.
+Every fix from v1.4 on was motivated directly by
+`corpus-study/README.md`'s hand-audited false-positive categories
+against real Erlang/OTP code - see that report for the full
+before/after qualification numbers at each release, including v1.5's
+own honest interim result (verifiably correct fixes that didn't move
+this specific corpus's qualifying count on their own, because every
+candidate they were expected to help turned out to need a *second*,
+independent fix too) and v1.6's resolution of it: 6 of 41 record-shaped
+candidates in the 30-file corpus now qualify, up from 2 after v1.4 and
+0 before it.
 
 Explicitly deferred: intra-clause `case`/`if` *guarding* a
 reconstruction within a single clause (not "free" the way clause-head
-dispatch is - declines cleanly when encountered); mutual tail recursion
-between multiple named functions; `lists:foldl`/`foldr` as an
-alternative loop shape; two-level (chained) interprocedural inlining;
-indirect entry construction (a record built in an earlier statement and
-passed by variable, rather than a literal `#rec{...}` at the call site -
-corpus-study Category E); an accumulator passed bare into an opaque
-helper mid-chain (would need real interprocedural purity verification,
-not just one-hop pure-reconstruction inlining).
+dispatch is - declines cleanly when encountered, e.g. `fetch_DTD/2`'s
+own genuinely-multiple-bare-use clause); mutual tail recursion between
+multiple named functions; `lists:foldl`/`foldr` as an alternative loop
+shape; two-level (chained) interprocedural inlining; an accumulator
+passed bare into an opaque helper mid-chain (would need real
+interprocedural purity verification, not just one-hop
+pure-reconstruction inlining - e.g. `initial_state/2`,
+`scan_comment1/5`, `scan_entity_value/7`).
 
 ## Layout
 
 - `src/asr_transform.erl` - the `parse_transform/2` entry point, qualification (phase 1), and rewrite (phase 2)
-- `test/asr_transform_tests.erl` - EUnit tests, positive (full reconstruction, partial update, pass-through, guards on both clause kinds, inlining with/without intermediate bindings, symmetric/asymmetric multi-accumulator, omitted-field-with-default entry call, base-case continuation handoff, head-alias pattern, hoisted intermediate binding) and negative/abort-safe (exported helper, bad call site, intra-clause case, name collision, guarded/multi-clause/nested-call/temp-collision inline declines, cross-accumulator scalar collision, two bare accumulator occurrences in one base clause, literal alias sub-pattern, escaping intermediate binding), each against paired fixture modules in `test/fixture_*.erl`
+- `test/asr_transform_tests.erl` - EUnit tests, positive (full reconstruction, partial update, pass-through, guards on both clause kinds, inlining with/without intermediate bindings, symmetric/asymmetric multi-accumulator, omitted-field-with-default entry call, base-case continuation handoff, head-alias pattern, hoisted intermediate binding, case-wrapped base clause, guard-converted alias field, indirect entry construction via bare variable and via update expression) and negative/abort-safe (exported helper, bad call site, intra-clause case, name collision, guarded/multi-clause/nested-call/temp-collision inline declines, cross-accumulator scalar collision, two bare accumulator occurrences in one base clause, nested alias sub-pattern with an embedded wildcard, escaping intermediate binding, non-variable/non-literal entry-call argument), each against paired fixture modules in `test/fixture_*.erl`
 - `corpus-study/` - a shape-recognizing analyzer run against 30 real Erlang/OTP files, measuring ASR candidate-loop density and hand-auditing why most decline; see `corpus-study/README.md`
 - `benchmarks/` - all 14 benchmarks from the paper's Table 1, ported from FOL's `benchmarks/fol-code/asr-*.fol`; see `benchmarks/README.md` for results and how to run them
 

@@ -25,8 +25,17 @@
 %% ahead of the tail call rather than directly in its own argument
 %% position, e.g. the shape behind xmerl's `?bump_col(N)` macro
 %% (try_hoist_single_binding/4, narrow slice - a chain of exactly one,
-%% no helper calls). See BEAM-asr design notes and README.md for the
-%% full qualification/rewrite spec.
+%% no helper calls). v1.6 adds three more: collect_var_uses/3 now
+%% recognizes `Var#rec{...}` as a safe touch of Var wherever it appears,
+%% not just when manually destructured at the tail-call position; a
+%% ground alias sub-pattern (no wildcards/bindings inside it, e.g.
+%% `#rec{tag=fixed}`) converts to an ordinary scalar pattern var plus an
+%% added `=:=` guard instead of declining (extract_accum_pat/1,
+%% is_ground_pattern/1); and an entry call's accumulator argument may be
+%% a bare variable or an update expression, not just a literal
+%% construction - fields are read directly off it instead
+%% (check_full_construction/5, splice_entry_args/3). See BEAM-asr design
+%% notes and README.md for the full qualification/rewrite spec.
 -module(asr_transform).
 -export([parse_transform/2]).
 
@@ -198,23 +207,34 @@ try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records, Defaults) ->
         throw:decline -> decline
     end.
 
-%% -- accumulator pattern extraction (v1.5, Category D) -------------------
+%% -- accumulator pattern extraction (v1.5 Category D, v1.6 guard slice) --
 
-%% Recognizes either a bare variable pattern, or a narrow-safe head-alias
-%% pattern `Var = #rec{field1 = SubVar1, field2 = _, ...}` (binding the
-%% whole accumulator AND destructuring some of its fields right in the
-%% clause head - e.g. `S=#xmerl_scanner{col = C}`, found throughout
-%% xmerl_scan.erl and httpc.erl in the corpus study). Every field
-%% sub-pattern must be a wildcard or a fresh plain-variable binding; a
-%% literal/nested constant sub-pattern (acting as an implicit guard, e.g.
-%% `#http_request_h{host = undefined}`) is NOT narrow-safe and returns
-%% none, same as today's decline for anything beyond a bare variable -
-%% that shape needs per-clause field patterns at rewrite time, out of
-%% scope here. Returns {ok, VName, RecNameOrUndefined, AliasFields} |
-%% none, where AliasFields is a #{AliasVar => FieldAtom} map (empty for
-%% a bare var).
+%% Recognizes either a bare variable pattern, or a head-alias pattern
+%% `Var = #rec{field1 = SubVar1, field2 = _, field3 = Literal, ...}`
+%% (binding the whole accumulator AND destructuring some of its fields
+%% right in the clause head - e.g. `S=#xmerl_scanner{col = C}`, found
+%% throughout xmerl_scan.erl and httpc.erl in the corpus study). Each
+%% field sub-pattern is one of:
+%%   - a wildcard: dropped, nothing to do:
+%%   - a fresh plain-variable binding: registered as an alias, renamed
+%%     to the field's scalar name at rewrite time (v1.5);
+%%   - a "ground" literal/nested pattern with no wildcards or variable
+%%     bindings anywhere inside it (e.g. `undefined`, or a fully literal
+%%     nested tuple): registered as a guard constraint - the field still
+%%     gets its ordinary scalar pattern var, plus an added guard testing
+%%     it equals the literal (v1.6) - `=:=` performs deep structural
+%%     equality, so this covers any depth of nesting as long as nothing
+%%     inside is a wildcard or binds a name;
+%%   - anything else (a wildcard/variable nested inside a substructure,
+%%     e.g. `{external,{entity,_}}`) can't be expressed as either a
+%%     rename or a single equality guard - not narrow-safe, returns none,
+%%     same as today's decline for anything beyond the above.
+%% Returns {ok, VName, RecNameOrUndefined, AliasFields, GuardConstraints}
+%% | none, where AliasFields is a #{AliasVar => FieldAtom} map and
+%% GuardConstraints is a [{FieldAtom, LiteralPattern}] list (both empty
+%% for a bare var).
 extract_accum_pat({var, _, V}) when V =/= '_' ->
-    {ok, V, undefined, #{}};
+    {ok, V, undefined, #{}, []};
 extract_accum_pat({match, _, {var, _, V}, {record, _, RecName, PatFields}}) when V =/= '_' ->
     extract_alias_fields(V, RecName, PatFields);
 extract_accum_pat({match, _, {record, _, RecName, PatFields}, {var, _, V}}) when V =/= '_' ->
@@ -224,10 +244,12 @@ extract_accum_pat(_) ->
 
 extract_alias_fields(V, RecName, PatFields) ->
     try
-        AliasList = lists:filtermap(fun alias_field/1, PatFields),
+        Classified = lists:filtermap(fun alias_field/1, PatFields),
+        AliasList = [{AV, F} || {alias, AV, F} <- Classified],
+        GuardList = [{F, Pat} || {guard, F, Pat} <- Classified],
         AliasVars = [AV || {AV, _F} <- AliasList],
         (length(AliasVars) =:= length(lists:usort(AliasVars))) orelse throw(not_narrow),
-        {ok, V, RecName, maps:from_list(AliasList)}
+        {ok, V, RecName, maps:from_list(AliasList), GuardList}
     catch
         throw:not_narrow -> none
     end.
@@ -235,9 +257,63 @@ extract_alias_fields(V, RecName, PatFields) ->
 alias_field({record_field, _, {atom, _, _F}, {var, _, '_'}}) ->
     false;
 alias_field({record_field, _, {atom, _, F}, {var, _, AliasV}}) when AliasV =/= '_' ->
-    {true, {AliasV, F}};
+    {true, {alias, AliasV, F}};
+alias_field({record_field, _, {atom, _, F}, SubPat}) ->
+    case is_ground_pattern(SubPat) of
+        true -> {true, {guard, F, SubPat}};
+        false -> throw(not_narrow)
+    end;
 alias_field(_) ->
     throw(not_narrow).
+
+%% A pattern with no wildcards or variable bindings anywhere inside it -
+%% literals share the same AST representation whether used as a pattern
+%% or an expression, so a ground pattern can be spliced directly into a
+%% guard as the right-hand side of `=:=` with no conversion at all.
+is_ground_pattern({atom, _, _}) -> true;
+is_ground_pattern({integer, _, _}) -> true;
+is_ground_pattern({float, _, _}) -> true;
+is_ground_pattern({string, _, _}) -> true;
+is_ground_pattern({char, _, _}) -> true;
+is_ground_pattern({nil, _}) -> true;
+is_ground_pattern({cons, _, H, T}) -> is_ground_pattern(H) andalso is_ground_pattern(T);
+is_ground_pattern({tuple, _, Elems}) -> lists:all(fun is_ground_pattern/1, Elems);
+is_ground_pattern(_) -> false.
+
+%% Builds the `ScalarVar =:= Literal` guard expression for a field's
+%% ground-pattern constraint.
+guard_constraint_expr(ScalarName, Pat) ->
+    Anno = element(2, Pat),
+    {op, Anno, '=:=', {var, Anno, ScalarName}, Pat}.
+
+%% Appends one guard expression, ANDed into every existing disjunct (or
+%% as the sole conjunct if there was no guard at all) - `(G1 orelse G2)
+%% andalso New` is `(G1 andalso New) orelse (G2 andalso New)`, so the
+%% same expression must be appended to each disjunct independently.
+append_guard_conjunct(Guards, ExtraGuardExpr) ->
+    case Guards of
+        [] -> [[ExtraGuardExpr]];
+        _ -> [Conjunct ++ [ExtraGuardExpr] || Conjunct <- Guards]
+    end.
+
+append_guard_conjuncts(Guards, ExtraGuardExprs) ->
+    lists:foldl(fun(E, G) -> append_guard_conjunct(G, E) end, Guards, ExtraGuardExprs).
+
+%% The guard-constraint expressions for every accumulator in Pairs (or a
+%% single {CP, AP} pair, for the non-recursive rewrite path), using each
+%% field's own canonical scalar name - already bound there by the
+%% ordinary (unchanged) pattern-splicing, since a ground-constrained
+%% field gets ITS scalar pattern var just like any other field.
+%% An `unrelated` CP has no `var` key at all (nothing was ever bound
+%% there), so it's filtered out here rather than defaulting - it can
+%% never carry a guard_constraints entry anyway.
+guard_constraint_exprs(Pairs) ->
+    lists:append(
+      [begin
+           ScalarMap = scalar_map(maps:get(var, CP), maps:get(fields, AP)),
+           [guard_constraint_expr(maps:get(F, ScalarMap), Pat)
+            || {F, Pat} <- maps:get(guard_constraints, CP, [])]
+       end || {CP, AP} <- Pairs, maps:get(kind, CP) =/= unrelated]).
 
 %% -- per-clause classification ------------------------------------------
 
@@ -260,23 +336,26 @@ classify_clause(Name, Arity, Pos, {clause, Anno, Patterns, Guard, Body}, RecAcc,
             classify_recursive(Pos, Anno, Patterns, Guard, Body, PatP, LastExpr, RecAcc, Name, Forms);
         false ->
             case extract_accum_pat(PatP) of
-                {ok, VName, RecName2, AliasFields} ->
-                    %% Every aliased field is treated as a field-read
-                    %% regardless of whether it's textually used later -
-                    %% harmless if unused (forces `base` instead of
-                    %% `unrelated`, which is always safe), but required
-                    %% if used: leaving such a clause `unrelated` would
-                    %% wipe its own pattern to wildcards at rewrite time
-                    %% while the body still references the alias var,
-                    %% an unbound-variable compile error.
+                {ok, VName, RecName2, AliasFields, GuardConstraints} ->
+                    %% Every aliased/guard-constrained field is treated
+                    %% as a field-read regardless of whether it's
+                    %% textually used later - harmless if unused (forces
+                    %% `base` instead of `unrelated`, which is always
+                    %% safe), but required if used: leaving such a
+                    %% clause `unrelated` would wipe its own pattern to
+                    %% wildcards at rewrite time while the body still
+                    %% references the alias var, an unbound-variable
+                    %% compile error.
                     Uses = collect_var_uses(VName, {Guard, Body})
-                        ++ [{field_read, RecName2, F} || {_AliasV, F} <- maps:to_list(AliasFields)],
+                        ++ [{field_read, RecName2, F} || {_AliasV, F} <- maps:to_list(AliasFields)]
+                        ++ [{field_read, RecName2, F} || {F, _Pat} <- GuardConstraints],
                     case Uses of
                         [] ->
                             {#{kind => unrelated, anno => Anno, patterns => Patterns,
                                guard => Guard, body => Body}, RecAcc};
                         _ ->
-                            classify_base(Anno, Patterns, Guard, Body, VName, AliasFields, Uses, RecAcc)
+                            classify_base(Anno, Patterns, Guard, Body, VName, AliasFields,
+                                          GuardConstraints, Uses, RecAcc)
                     end;
                 none ->
                     {#{kind => unrelated, anno => Anno, patterns => Patterns,
@@ -299,18 +378,19 @@ classify_clause(Name, Arity, Pos, {clause, Anno, Patterns, Guard, Body}, RecAcc,
 %% continuation-passing scanner) needs no special-casing at all once the
 %% qualification gate stops assuming the bare occurrence can only be the
 %% clause's own entire trailing expression.
-classify_base(Anno, Patterns, Guard, Body, VName, AliasFields, Uses, RecAcc) ->
+classify_base(Anno, Patterns, Guard, Body, VName, AliasFields, GuardConstraints, Uses, RecAcc) ->
     BareCount = length([U || U <- Uses, U =:= bare]),
     (BareCount =< 1) orelse throw(decline),
     FieldReads = [R || {field_read, R, _F} <- Uses],
     RecAcc2 = unify_recname(RecAcc, FieldReads),
     {#{kind => base, anno => Anno, patterns => Patterns, guard => Guard,
-       body => Body, var => VName, alias_fields => AliasFields}, RecAcc2}.
+       body => Body, var => VName, alias_fields => AliasFields,
+       guard_constraints => GuardConstraints}, RecAcc2}.
 
 classify_recursive(Pos, Anno, Patterns, Guard, Body, PatP, TailCall, RecAcc, Name, Forms) ->
-    {VName, RecNameFromPat, AliasFields} =
+    {VName, RecNameFromPat, AliasFields, GuardConstraints} =
         case extract_accum_pat(PatP) of
-            {ok, V, RN, AF} -> {V, RN, AF};
+            {ok, V, RN, AF, GC} -> {V, RN, AF, GC};
             none -> throw(decline)
         end,
     RecAcc0 = case RecNameFromPat of
@@ -368,7 +448,8 @@ classify_recursive(Pos, Anno, Patterns, Guard, Body, PatP, TailCall, RecAcc, Nam
         end,
     CP = #{kind => recursive, anno => Anno, patterns => Patterns, guard => Guard,
            body => Body1, var => VName, tail_call => TailCall1, orig_tail_call => TailCall,
-           tail_anno => CAnno, tail_f => CF, arg_kind => ArgKind, alias_fields => AliasFields},
+           tail_anno => CAnno, tail_f => CF, arg_kind => ArgKind, alias_fields => AliasFields,
+           guard_constraints => GuardConstraints},
     {CP, RecAcc2}.
 
 %% Finds a statement `Vk = VName#rec{...}` (or `Vk = #rec{...}` full
@@ -494,18 +575,44 @@ check_collision(#{var := VName, patterns := Patterns, guard := Guard, body := Bo
 validate_field_names(#{kind := unrelated}, _Fields) -> ok;
 validate_field_names(#{kind := base, var := VName, guard := Guard, body := Body} = CP, Fields) ->
     Uses = collect_var_uses(VName, {Guard, Body}),
-    FieldAtoms = [F || {field_read, _R, F} <- Uses] ++ maps:values(maps:get(alias_fields, CP, #{})),
+    FieldAtoms = [F || {field_read, _R, F} <- Uses]
+        ++ maps:values(maps:get(alias_fields, CP, #{}))
+        ++ [F || {F, _Pat} <- maps:get(guard_constraints, CP, [])],
     lists:foreach(fun(F) -> lists:member(F, Fields) orelse throw(decline) end, FieldAtoms);
 validate_field_names(#{kind := recursive, var := VName, guard := Guard, body := Body,
                         tail_call := TailCall} = CP, Fields) ->
     Uses = collect_var_uses(VName, {Guard, Body, TailCall}),
-    FieldAtoms = [F || {field_read, _R, F} <- Uses] ++ maps:values(maps:get(alias_fields, CP, #{})),
+    FieldAtoms = [F || {field_read, _R, F} <- Uses]
+        ++ maps:values(maps:get(alias_fields, CP, #{}))
+        ++ [F || {F, _Pat} <- maps:get(guard_constraints, CP, [])],
     lists:foreach(fun(F) -> lists:member(F, Fields) orelse throw(decline) end, FieldAtoms).
 
 %% A field omitted from the construction is fine as long as it has a
 %% default (always true per collect_record_defaults/1's own doc comment -
 %% Erlang implicitly defaults every field to `undefined` even without an
 %% explicit declaration) - only an actually-unknown field name declines.
+%%
+%% v1.6 Category E: a bare variable is accepted too - e.g.
+%% xmerl_scan.erl's `strip(Str,S) -> strip(Str,S,all)`, where S is
+%% simply the caller's own parameter, not a literal construction at all.
+%% There's nothing to statically validate here (no field list to check
+%% field names against), but nothing needs to be: splice_entry_args/3
+%% reads each field directly off the variable at rewrite time
+%% (`Var#rec.field`), which is exactly what the callee's own original
+%% pattern-matching would have required of that value anyway - if it
+%% isn't actually shaped like RecName at runtime, the original program
+%% was already relying on that never happening (a badmatch there before
+%% this transform, a badrecord here after it - both loud failures, never
+%% silent miscompilation).
+%%
+%% An update expression at the call site (`Var#rec{col=Expr}`) is a
+%% third shape, same spirit as the bare-variable case: explicitly
+%% overridden fields are known statically (validated the same way full
+%% construction is), and every other field is read directly off the
+%% base variable rather than needing a default at all - it's not
+%% "omitted," it's just left unchanged, which is exactly what `#rec{}`
+%% update syntax itself means. Found via xmerl_scan.erl's
+%% `scan_xml_vsn/2 -> xml_vsn(T, S#xmerl_scanner{col=S#xmerl_scanner.col+1}, H, [])`.
 check_full_construction(CallTerm, Pos, RecName, Fields, RecordDefaults) ->
     {call, _Anno, _F, Args} = CallTerm,
     ArgP = lists:nth(Pos, Args),
@@ -515,6 +622,11 @@ check_full_construction(CallTerm, Pos, RecName, Fields, RecordDefaults) ->
             (FieldNames -- Fields) =:= [] orelse throw(decline),
             Missing = Fields -- FieldNames,
             lists:all(fun(F) -> maps:is_key(F, RecordDefaults) end, Missing) orelse throw(decline);
+        {record, _, {var, _, _}, RecName2, FieldList} when RecName2 =:= RecName ->
+            FieldNames = [FN || {record_field, _, {atom, _, FN}, _} <- FieldList],
+            (FieldNames -- Fields) =:= [] orelse throw(decline);
+        {var, _, VarName} when VarName =/= '_' ->
+            ok;
         _ ->
             throw(decline)
     end.
@@ -549,6 +661,15 @@ collect_var_uses(VarName, Term) ->
 
 collect_var_uses(VarName, {record_field, _, {var, _, VarName}, RecName, {atom, _, FieldAtom}}, Acc) ->
     [{field_read, RecName, FieldAtom} | Acc];
+%% v1.6: an update expression `VarName#rec{...}` is a safe touch of
+%% VarName wherever it appears, not just when the recursive ArgP switch
+%% manually destructures it at the tail-call position - it derives a
+%% fresh value from VarName's current fields without aliasing or leaking
+%% VarName itself. Recurse into FieldList only, so a genuinely unsafe
+%% bare use (or a legitimate field read) inside a field value expression
+%% is still caught.
+collect_var_uses(VarName, {record, _, {var, _, VarName}, _RecName, FieldList}, Acc) ->
+    collect_var_uses(VarName, FieldList, Acc);
 collect_var_uses(VarName, {var, _, VarName}, Acc) ->
     [bare | Acc];
 collect_var_uses(VarName, Term, Acc) when is_tuple(Term) ->
@@ -719,12 +840,41 @@ splice_entry_args([Arg | Rest], Idx, PosMap) ->
     case maps:find(Idx, PosMap) of
         {ok, AP} ->
             Fields = maps:get(fields, AP),
-            Defaults = maps:get(defaults, AP),
-            {record, _, _RecName, FieldList} = Arg,
-            FieldExprs = [field_expr_or_default(FieldList, F, Defaults) || F <- Fields],
+            RecName = maps:get(rec, AP),
+            FieldExprs =
+                case Arg of
+                    {record, _, _RecName, FieldList} ->
+                        Defaults = maps:get(defaults, AP),
+                        [field_expr_or_default(FieldList, F, Defaults) || F <- Fields];
+                    {record, _, BaseVar, _RecName, FieldList} ->
+                        %% Category E, update-expression shape: an
+                        %% explicitly overridden field uses that
+                        %% expression as-is; every other field is read
+                        %% directly off the base variable, since
+                        %% `#rec{}` update syntax leaves it unchanged -
+                        %% not "omitted," so no default applies.
+                        [entry_update_field_expr(FieldList, F, BaseVar, RecName) || F <- Fields];
+                    {var, VAnno, VarName} ->
+                        %% Category E, bare-variable shape: the record
+                        %% arrives as an already-bound variable (e.g. a
+                        %% caller's own parameter, forwarded through)
+                        %% rather than a literal construction - read
+                        %% each field directly off it instead of
+                        %% constructing anything.
+                        [{record_field, VAnno, {var, VAnno, VarName}, RecName, {atom, VAnno, F}}
+                         || F <- Fields]
+                end,
             FieldExprs ++ Tail;
         error ->
             [Arg | Tail]
+    end.
+
+entry_update_field_expr(FieldList, F, BaseVar, RecName) ->
+    case find_field_expr(FieldList, F) of
+        {ok, Expr} -> Expr;
+        error ->
+            VAnno = element(2, BaseVar),
+            {record_field, VAnno, BaseVar, RecName, {atom, VAnno, F}}
     end.
 
 %% Groups one clause-plan per accumulator (same original clause, per
@@ -749,7 +899,7 @@ rewrite_clause_multi(CPGroup, Accums) ->
     end.
 
 rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
-    {NewGuard, NewBody} =
+    {NewGuard0, NewBody} =
         lists:foldl(
           fun({CP, AP}, {G, B}) ->
                   case maps:get(kind, CP) of
@@ -766,6 +916,11 @@ rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
                           {G1, B2}
                   end
           end, {Guard0, Body0}, Pairs),
+    %% v1.6: a ground-literal alias sub-pattern (e.g. `#rec{tag=fixed}`)
+    %% converts to an ordinary scalar pattern var (already handled above
+    %% via ScalarMap) plus this added guard testing it against the
+    %% literal - the field never needed a rename, just a constraint.
+    NewGuard = append_guard_conjuncts(NewGuard0, guard_constraint_exprs(Pairs)),
     NewPatterns = splice_patterns_multi(Patterns, Pairs),
     {clause, Anno, NewPatterns, NewGuard, NewBody}.
 
@@ -779,7 +934,8 @@ rewrite_recursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
     NonLast = lists:sublist(Body0, 1, length(Body0) - 1),
     NonLast1 = subst_all(NonLast, AllSubs),
     NewBody = NonLast1 ++ AllPrelude ++ [NewTailCall],
-    NewGuard = subst_all(Guard0, AllSubs),
+    NewGuard0 = subst_all(Guard0, AllSubs),
+    NewGuard = append_guard_conjuncts(NewGuard0, guard_constraint_exprs(Pairs)),
     NewPatterns = splice_patterns_multi(Patterns, Pairs),
     {clause, Anno, NewPatterns, NewGuard, NewBody}.
 
