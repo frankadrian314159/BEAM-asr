@@ -92,6 +92,34 @@ smaller relative wins too, for the same reason: allocation elimination is
 a fixed per-iteration saving, so it matters less as a fraction of total
 work when that work is itself larger.
 
+## Never negative: a useful contrast with Julia-asr's Kalman regression
+
+Every one of these 14 benchmarks measures a real speedup, including
+Kalman (1.34x here) and Twobody (1.52x) - the two largest, most
+complex benchmarks, each with a second accumulator and (for Kalman)
+13 intermediate bindings per iteration. This was specifically re-checked
+across three independent runs of Kalman alone (1.37x/1.39x/1.50x) after
+`Julia-asr`'s own Kalman benchmark turned up a reproducible **0.87x
+regression** on the same shape - `@allocated` there confirmed both the
+baseline and `@asr`'d Julia versions were already zero-allocation (Julia's
+own JIT eliminates the struct via escape analysis before the transform
+ever runs), so the regression was ASR's own parallel temp-then-assign
+staging adding real copy-through overhead with no allocation win left to
+offset it.
+
+BEAM never hits that failure mode, for a structural reason: an Erlang
+record is a genuine heap-allocated tagged tuple, not a value type a
+JIT's escape analysis can unbox away - so the allocation ASR eliminates
+here is real and present in every one of these 14 baselines, never
+already optimized away by the BEAM VM itself. The transform's own
+overhead (temp-name staging, the same mechanism in both ports) is real
+in both languages, but it's competing against a genuine allocation cost
+here, and a phantom one there. Put together, the two ports' Kalman
+numbers make a single point concretely: ASR's payoff isn't just
+*smaller* or *larger* depending on the host - it can flip sign entirely,
+and which way it flips depends on whether the host compiler already does
+some of the transform's own job.
+
 ## Caveats (v1-v1.3 scope)
 
 Single machine, no statistical significance testing beyond the trial
