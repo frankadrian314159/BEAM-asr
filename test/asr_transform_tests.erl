@@ -29,6 +29,22 @@ guards_test() ->
                  fixture_guards_asr:run(12345)),
     assert_qualified(fixture_guards, loop, 3, 4).
 
+%% Record field defaults (v1.4, Category A from the corpus study): an
+%% entry call may omit a field that has a declared (or Erlang's own
+%% implicit `undefined`) default - found via digraph:set_type/2 in
+%% Erlang/OTP's stdlib, which declines under the old exact-match rule.
+default_field_test() ->
+    ?assertEqual(fixture_default_field:run(500), fixture_default_field_asr:run(500)),
+    assert_qualified(fixture_default_field, loop, 3, 6).
+
+%% Base-case continuation handoff (v1.4, Category B from the corpus
+%% study): the base case hands the accumulator to another function
+%% instead of returning it bare - found via inets/httpc.erl's
+%% header_record/4 and throughout xmerl_scan.erl.
+base_handoff_test() ->
+    ?assertEqual(fixture_base_handoff:run(500), fixture_base_handoff_asr:run(500)),
+    assert_qualified(fixture_base_handoff, loop, 3, 4).
+
 %% Interprocedural inlining (v1.1): the reconstruction lives in a
 %% separate one-level-inlinable helper function, not literally in the
 %% tail call's own argument.
@@ -101,6 +117,11 @@ multi_scalar_collision_declines_test() ->
     R = fixture_multi_scalar_collision:run(500),
     ?assertEqual(1000, R),
     assert_declined(fixture_multi_scalar_collision).
+
+base_double_bare_declines_test() ->
+    R = fixture_base_double_bare:run(500),
+    ?assertEqual({{pt, 500.0, 1000.0}, {pt, 500.0, 1000.0}}, R),
+    assert_declined(fixture_base_double_bare).
 
 %% ---------------------------------------------------------------------
 %% Helpers

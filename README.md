@@ -27,7 +27,7 @@ its next *fully-qualified* (`Mod:F(...)`) call, so a self-recursive
 module docstring in `src/asr_transform.erl` and the design notes
 referenced from the commit history for the full reasoning.
 
-## Status: v1 + v1.1 (interprocedural inlining) + v1.2 (multi-accumulator) + v1.3 (branch-shaped reconstruction)
+## Status: v1 + v1.1 (interprocedural inlining) + v1.2 (multi-accumulator) + v1.3 (branch-shaped reconstruction) + v1.4 (record field defaults, base-case continuation handoff)
 
 | Concept | This port |
 |---|---|
@@ -38,8 +38,15 @@ referenced from the commit history for the full reasoning.
 | No FOL/cpython-asr analog - world guard | not needed; see above |
 | `_try_inline_call` (cpython-asr v1.1) | `asr_transform:try_inline/3` - one-level inlining of a single-clause, unguarded helper whose body is a straight-line sequence of field-read-only intermediate bindings terminating in a full reconstruction; gensym'd temp names collision-checked against the caller clause |
 | `_try_branch_reconstruction`/multi-accumulator fixpoint (cpython-asr v1.2) | **branch-shaped reconstruction needs no new code at all** - FOL's `cond`/`if`/`case` maps onto Erlang's own idiomatic guarded multi-clause dispatch, which v1's per-clause classification already handles; **multi-accumulator** is `combine_accum_plans/3` - every candidate position is qualified fully independently (cross-accumulator field reads are already tolerated for free, since `collect_var_uses` doesn't care which argument position it's scanning), then combined with one extra check (`check_cross_scalar_collision/1`) and one shared rewrite pass (`rewrite_recursive_multi/5`, `rewrite_nonrecursive_multi/5`) |
+| Record field defaults (v1.4, corpus-study Category A) | `collect_record_defaults/1` resolves every field's declared (or Erlang's own implicit `undefined`) default; `check_full_construction/5` accepts an entry call that omits a field with a default instead of requiring every field named explicitly; `field_expr_or_default/3` supplies it at rewrite time |
+| Base-case continuation handoff (v1.4, corpus-study Category B) | `classify_base/7` allows the accumulator's one remaining bare occurrence anywhere in the clause (guard or body, not just trailing position) - `subst_bare_return/5` was already a fully generic tree walk that re-boxes wherever it finds that occurrence, so no rewrite-side change was needed, only the qualification-time restriction was removed |
 
-Explicitly deferred to v1.4+: intra-clause `case`/`if` *guarding* a
+Both v1.4 fixes were motivated directly by `corpus-study/README.md`'s
+hand-audited false-positive categories against real Erlang/OTP code
+(`digraph:set_type/2`, `httpc:header_record/4`) - see that report for
+the full before/after qualification numbers.
+
+Explicitly deferred to v1.5+: intra-clause `case`/`if` *guarding* a
 reconstruction within a single clause (not "free" the way clause-head
 dispatch is - declines cleanly when encountered); mutual tail recursion
 between multiple named functions; `lists:foldl`/`foldr` as an
@@ -48,7 +55,8 @@ alternative loop shape; two-level (chained) interprocedural inlining.
 ## Layout
 
 - `src/asr_transform.erl` - the `parse_transform/2` entry point, qualification (phase 1), and rewrite (phase 2)
-- `test/asr_transform_tests.erl` - EUnit tests, positive (full reconstruction, partial update, pass-through, guards on both clause kinds, inlining with/without intermediate bindings, symmetric/asymmetric multi-accumulator) and negative/abort-safe (exported helper, bad call site, intra-clause case, name collision, guarded/multi-clause/nested-call/temp-collision inline declines, cross-accumulator scalar collision), each against paired fixture modules in `test/fixture_*.erl`
+- `test/asr_transform_tests.erl` - EUnit tests, positive (full reconstruction, partial update, pass-through, guards on both clause kinds, inlining with/without intermediate bindings, symmetric/asymmetric multi-accumulator, omitted-field-with-default entry call, base-case continuation handoff) and negative/abort-safe (exported helper, bad call site, intra-clause case, name collision, guarded/multi-clause/nested-call/temp-collision inline declines, cross-accumulator scalar collision, two bare accumulator occurrences in one base clause), each against paired fixture modules in `test/fixture_*.erl`
+- `corpus-study/` - a shape-recognizing analyzer run against 30 real Erlang/OTP files, measuring ASR candidate-loop density and hand-auditing why most decline; see `corpus-study/README.md`
 - `benchmarks/` - all 14 benchmarks from the paper's Table 1, ported from FOL's `benchmarks/fol-code/asr-*.fol`; see `benchmarks/README.md` for results and how to run them
 
 ## Running

@@ -2,14 +2,25 @@
 
 A shape-recognizing analyzer for ASR candidate loops in Erlang, run
 against 30 real files from Erlang/OTP, reporting candidate-loop density
-and — since none of the candidates found actually qualify under the
-real transform — a categorized, hand-audited breakdown of why.
-Methodology mirrors FOL's own corpus study
-(`../../FOL/fol/docs/cgo2027/corpus-study/`) and cpython-asr's
+and a categorized, hand-audited breakdown of why most candidates don't
+qualify under the real transform. Methodology mirrors FOL's own corpus
+study (`../../FOL/fol/docs/cgo2027/corpus-study/`) and cpython-asr's
 (`../../cpython-asr/corpus-study/`): a syntactic-shape Pass 1 (an
 upper-bound proxy) followed by a gate-faithful Pass 2 that runs the
 *real* `asr_transform.erl` as a black-box oracle, never a
-re-implementation that could drift from the actual v1–v1.3 rules.
+re-implementation that could drift from the actual v1–v1.4 rules.
+
+**Update (v1.4)**: this study's own Category A and Category B findings
+(below) were fed back into `asr_transform.erl` as two targeted fixes —
+record-declared-default support for omitted entry-call fields (Category
+A), and relaxing the base-case gate to allow the accumulator's one
+remaining bare occurrence anywhere in the clause, not just as its
+trailing return (Category B). Re-running this exact study against the
+updated transform now shows 2 of 41 candidates qualifying:
+`digraph:set_type/2` (Category A) and `httpc:header_record/4` (Category
+B). The numbers below reflect that re-run; the original 0-of-41 result
+is what motivated the fixes in the first place, not an error corrected
+after the fact.
 
 ## The analyzer
 
@@ -86,17 +97,19 @@ Total LOC: 83,457 (83.46 KLOC)
 Tail-self-recursive functions (loop sites, unique): 345
 Candidate positions by kind: record_strong=10  record_weak=31  map=0  collection=0  scalar=0  other=0
 Record-shaped (strong+weak) positions: 41
-Gate-faithful qualification: qualified=0  declined=41  unknown=0
+Gate-faithful qualification: qualified=2  declined=39  unknown=0
 ```
 
 **Headline density**: 41 record-shaped candidate positions across 345
 loop sites (11.9% of loop sites have at least one record-shaped
-position) and 83.46 KLOC (0.49 candidate positions per KLOC) — but
-**0 of 41 (0%) actually qualify** under the real v1–v1.3 transform.
-The honest bracket, mirroring FOL/cpython-asr's own framing: *at most*
+position) and 83.46 KLOC (0.49 candidate positions per KLOC).
+Under the original v1–v1.3 transform, **0 of 41 (0%) qualified**; after
+the Category A/B fixes below shipped as v1.4, **2 of 41 (4.9%) now
+qualify** — `digraph:set_type/2` and `httpc:header_record/4`. The
+honest bracket, mirroring FOL/cpython-asr's own framing: *at most*
 11.9% of loop sites are record-accumulator-shaped by syntax; *at least*
-0% (measured, not estimated) are actually ASR-addressable in this
-corpus as written.
+4.9% (measured, not estimated) are actually ASR-addressable in this
+corpus as written, up from 0% before v1.4.
 
 ### Per-file / per-domain breakdown
 
@@ -107,7 +120,7 @@ corpus as written.
 | stdlib/src/string.erl | stdlib-strings | 3.17 | 25 | 0 | 3 | 0 |
 | stdlib/src/gen_server.erl | stdlib-otp-behavior | 3.12 | 5 | 0 | 1 | 0 |
 | stdlib/src/maps.erl | stdlib-maps | 1.34 | 6 | 0 | 3 | 0 |
-| stdlib/src/digraph.erl | stdlib-graphs | 0.88 | 6 | 1 | 0 | 0 |
+| stdlib/src/digraph.erl | stdlib-graphs | 0.88 | 6 | 1 | 0 | 1 |
 | compiler/src/v3_core.erl | compiler | 4.64 | 26 | 0 | 4 | 0 |
 | crypto/src/crypto.erl | crypto | 4.30 | 13 | 0 | 0 | 0 |
 | ssl/src/ssl.erl | ssl-tls | 3.94 | 3 | 0 | 0 | 0 |
@@ -115,7 +128,7 @@ corpus as written.
 | ssh/src/ssh.erl | ssh-protocol | 1.39 | 2 | 0 | 1 | 0 |
 | mnesia/src/mnesia.erl | database | 5.31 | 15 | 0 | 5 | 0 |
 | xmerl/src/xmerl_scan.erl | xml-parsing | 4.38 | 39 | 7 | 2 | 0 |
-| inets/src/http_client/httpc.erl | http-client | 2.04 | 7 | 2 | 1 | 0 |
+| inets/src/http_client/httpc.erl | http-client | 2.04 | 7 | 2 | 1 | 1 |
 | asn1/src/asn1ct.erl | asn1-encoding | 2.33 | 17 | 0 | 0 | — |
 | diameter/src/base/diameter.erl | telecom-protocol | 2.08 | 0 | 0 | 0 | — |
 | megaco/src/engine/megaco_config.erl | telecom-protocol | 2.19 | 4 | 0 | 0 | — |
@@ -139,7 +152,7 @@ account for over a third of all record-shaped hits — both are exactly
 the kind of "structured protocol state" code the shape-recognizer is
 designed to catch, and the corpus's clearest domain-level concentration.
 
-## Why zero qualify: three categories, hand-audited
+## Why (almost) none qualified: three categories, hand-audited, two now fixed
 
 Every `record_strong` hit and a representative sample of `record_weak`
 hits were read directly (not inferred from the tool's own decline path,
@@ -147,13 +160,15 @@ which carries no reason string by design — see BEAM-asr's "clean
 decline" discipline) and re-run against a minimal reproduction to
 confirm the actual cause. Three distinct categories emerged, mirroring
 FOL/cpython-asr's own structurally-unfixable / analysis-gap / scanner-noise
-split:
+split. This analysis is preserved historically below (it's what
+motivated the v1.4 fixes); the "Now" column reflects the current,
+post-fix status of each category's representative site.
 
-| Category | Site | File | Reason |
-|---|---|---|---|
-| **A — analysis gap (fixable)** | `set_type/2` | stdlib/digraph.erl | Entry call `set_type(Ts, #digraph{vtab=V, etab=E, ntab=N})` omits the `cyclic` field, relying on the record's own declared default (`cyclic = true`). `check_full_construction` requires every field named explicitly; it doesn't know about record-declared defaults. **Confirmed by direct repro**: the identical function qualifies the instant `cyclic` is spelled out at the call site. Directly analogous to cpython-asr's own v1.7 fix for Python's live-reflection-only defaults. |
-| **B — scope boundary (base case hands off, doesn't return)** | `header_record/4` | inets/httpc.erl | Base case is `header_record([], H, ...) -> validate_headers(H, ...)` — it *pipes* the accumulator into another function rather than returning it bare or reading only its fields. v1's rule only re-boxes a literal tail-position `return`-equivalent (the bare accumulator itself); a "hand off to a continuation" is a different, unsupported shape. **Confirmed by direct repro.** Same root pattern accounts for 7 of the 8 xmerl_scan.erl hits, which use a continuation-passing scanner design (`F(fun(...) -> scan(...) end, ...)`) throughout — an idiom this whole file is built around. |
-| **C — Pass-1 over-approximation (scanner noise, not a real ASR limitation)** | `do_flatten/2`, `init_it/6`, `foreach_1/3`, `pkix_dist_points/1`, `uguard/4`, `sleep/1` | lists/gen_server/maps/public_key/v3_core/ct | The flagged "helper call" is unrelated to records entirely: a nested list-building self-call (`do_flatten`), a BIF (`self()`), an opaque-iterator advance (`try_next`), a cert-decoding call, a compiler-internal list helper, and a units-normalization redirect (`sleep({hours,H}) -> sleep(...)`) respectively. `record_weak` is deliberately loose (any call at that position, unverified) — Pass 2 correctly rejects all of these, and by direct inspection none was ever a record-accumulator loop at all. **This is the dominant category by volume**: every `record_weak` hit sampled (6 of 31, spanning 6 different files) fell into it. |
+| Category | Site | File | Reason | Now |
+|---|---|---|---|---|
+| **A — analysis gap** | `set_type/2` | stdlib/digraph.erl | Entry call `set_type(Ts, #digraph{vtab=V, etab=E, ntab=N})` omits the `cyclic` field, relying on the record's own declared default (`cyclic = true`). `check_full_construction` required every field named explicitly; it didn't know about record-declared defaults. **Confirmed by direct repro**: the identical function qualified the instant `cyclic` was spelled out at the call site. Directly analogous to cpython-asr's own v1.7 fix for Python's live-reflection-only defaults. | **Fixed in v1.4** — `collect_record_defaults/1` now resolves every declared (or Erlang's own implicit `undefined`) default; `set_type/2` qualifies. |
+| **B — scope boundary (base case hands off, doesn't return)** | `header_record/4` | inets/httpc.erl | Base case is `header_record([], H, ...) -> validate_headers(H, ...)` — it *pipes* the accumulator into another function rather than returning it bare or reading only its fields. v1's rule only re-boxed a literal tail-position `return`-equivalent (the bare accumulator itself); a "hand off to a continuation" was a different, unsupported shape. **Confirmed by direct repro.** Same root pattern accounts for 7 of the 8 xmerl_scan.erl hits, which use a continuation-passing scanner design (`F(fun(...) -> scan(...) end, ...)`) throughout — an idiom this whole file is built around. | **Fixed in v1.4** — `classify_base/7` now allows the accumulator's one remaining bare occurrence anywhere in the clause, not just in trailing position; `header_record/4` qualifies. The 7 xmerl_scan.erl siblings still decline — the handoff shape wasn't their only gate failure (not re-audited individually; see caveats). |
+| **C — Pass-1 over-approximation (scanner noise, not a real ASR limitation)** | `do_flatten/2`, `init_it/6`, `foreach_1/3`, `pkix_dist_points/1`, `uguard/4`, `sleep/1` | lists/gen_server/maps/public_key/v3_core/ct | The flagged "helper call" is unrelated to records entirely: a nested list-building self-call (`do_flatten`), a BIF (`self()`), an opaque-iterator advance (`try_next`), a cert-decoding call, a compiler-internal list helper, and a units-normalization redirect (`sleep({hours,H}) -> sleep(...)`) respectively. `record_weak` is deliberately loose (any call at that position, unverified) — Pass 2 correctly rejects all of these, and by direct inspection none was ever a record-accumulator loop at all. **This is the dominant category by volume**: every `record_weak` hit sampled (6 of 31, spanning 6 different files) fell into it. | Unaffected by v1.4 — these were never record-accumulator loops, so no analysis-gap fix applies. |
 
 No example of the fourth, FOL/cpython-asr-named "structurally unfixable"
 category (their "aliased-reference"/quicksort-swap shape) turned up in
@@ -161,6 +176,22 @@ this corpus — plausibly because that shape is specific to in-place
 swap/rotate algorithms operating on a mutable collection, which is rare
 in idiomatic Erlang (no in-place mutation at all) rather than because
 BEAM-asr's qualification is somehow immune to it.
+
+**Why only 1 of 8 Category B sites actually flipped to qualifying**:
+the base-case-handoff fix removes exactly one gate constraint. A site
+still declines if it fails a *different* constraint — e.g. more than
+one bare occurrence of the accumulator in the clause, a field-name
+mismatch, or (for `xmerl_scan.erl` specifically) many of its 7 sibling
+hits sit in functions with 15–31 clauses total, only a handful of which
+are the recursive/base pair this scanner's Pass 1 flagged position
+against; the actual gate runs the whole real transform across every
+clause, and OTP's scanner functions are large enough that a second,
+independent decline reason is plausible in several of them. This wasn't
+re-audited clause-by-clause for this update (would require the same
+manual-repro discipline as the original category read); the honest
+claim is narrower than "Category B is fixed" — it's "the base-handoff
+*shape itself* no longer blocks qualification," which is exactly what
+`fixture_base_handoff.erl`'s EUnit coverage verifies in isolation.
 
 ## Honest caveats
 
@@ -189,16 +220,20 @@ BEAM-asr's qualification is somehow immune to it.
   exactly as they'd run in production — a candidate declining here is a
   genuine decline under the current shipped rules, not an artifact of a
   simplified study-only checker.
-- **0% qualifying in this specific corpus should not be read as "ASR
-  is useless for real Erlang code"** — the benchmarks (`../benchmarks/`)
-  demonstrate ASR provides genuine 1.0x-1.79x wins on the exact
-  reconstruct-a-fresh-record-each-iteration shape it targets. This study's
-  finding is narrower and more useful than that: real OTP library code's
-  record-accumulator loops are overwhelmingly *not* shaped like FOL's own
-  motivating benchmark pattern (an accumulator freshly constructed right
-  at the loop's own entry point) - they're either threaded in from a
-  caller that constructed the value elsewhere (category A), piped into a
-  continuation rather than returned (category B), or not record loops at
-  all once you look past the syntax (category C). That's a real,
-  actionable finding about where the mechanism's applicability boundary
-  currently sits, not a verdict on its usefulness.
+- **4.9% qualifying in this specific corpus (up from 0% pre-v1.4)
+  should not be read as "ASR now handles most real Erlang code"** — the
+  benchmarks (`../benchmarks/`) demonstrate ASR provides genuine
+  1.0x-1.79x wins on the exact reconstruct-a-fresh-record-each-iteration
+  shape it targets. This study's finding is narrower and more useful
+  than that: real OTP library code's record-accumulator loops were
+  overwhelmingly *not* shaped like FOL's own motivating benchmark
+  pattern (an accumulator freshly constructed right at the loop's own
+  entry point) - they were either threaded in from a caller that
+  constructed the value elsewhere (category A, now fixed), piped into a
+  continuation rather than returned (category B, now fixed as a shape
+  but only 1 of 8 sampled sites flipped), or not record loops at all
+  once you look past the syntax (category C, unfixable because
+  unrelated). That's a real, actionable finding about where the
+  mechanism's applicability boundary sits and how narrowly a targeted
+  analysis-gap fix moves it, not a verdict on its usefulness — nor a
+  claim that the boundary is now solved.

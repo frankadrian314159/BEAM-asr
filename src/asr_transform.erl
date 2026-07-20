@@ -9,8 +9,15 @@
 %% the same recursion simultaneously; branch-shaped reconstruction
 %% (cond/if/case in the source language) needs no extra support at all,
 %% since it maps onto Erlang's own idiomatic guarded multi-clause dispatch,
-%% which per-clause classification already handles. See BEAM-asr design
-%% notes and README.md for the full qualification/rewrite spec.
+%% which per-clause classification already handles. v1.4 adds two fixes
+%% found by the corpus study (corpus-study/README.md): an entry call may
+%% omit a field that has a record-declared (or Erlang's own implicit
+%% `undefined`) default (collect_record_defaults/1, check_full_construction/5);
+%% and a base case may hand the accumulator to a continuation function
+%% instead of returning it bare, since subst_bare_return/5 already
+%% re-boxes wherever the accumulator's one remaining bare occurrence
+%% falls, not just in trailing position (classify_base/7). See BEAM-asr
+%% design notes and README.md for the full qualification/rewrite spec.
 -module(asr_transform).
 -export([parse_transform/2]).
 
@@ -20,22 +27,23 @@
 
 parse_transform(Forms, _Options) ->
     Records = collect_records(Forms),
+    Defaults = collect_record_defaults(Forms),
     Exports = collect_exports(Forms),
     Plans = lists:filtermap(
-              fun(Form) -> try_qualify_form(Form, Forms, Records, Exports) end,
+              fun(Form) -> try_qualify_form(Form, Forms, Records, Defaults, Exports) end,
               Forms),
     apply_plans(Forms, Plans).
 
-try_qualify_form({function, _Anno, Name, Arity, Clauses}, Forms, Records, Exports) ->
+try_qualify_form({function, _Anno, Name, Arity, Clauses}, Forms, Records, Defaults, Exports) ->
     case sets:is_element({Name, Arity}, Exports) of
         true -> false;
         false ->
-            case try_qualify(Name, Arity, Clauses, Forms, Records) of
+            case try_qualify(Name, Arity, Clauses, Forms, Records, Defaults) of
                 {ok, Plan} -> {true, Plan};
                 decline -> false
             end
     end;
-try_qualify_form(_Form, _Forms, _Records, _Exports) ->
+try_qualify_form(_Form, _Forms, _Records, _Defaults, _Exports) ->
     false.
 
 %% ---------------------------------------------------------------------
@@ -56,6 +64,27 @@ collect_records(Forms) ->
 field_name({record_field, _, {atom, _, FName}}) -> FName;
 field_name({record_field, _, {atom, _, FName}, _Default}) -> FName;
 field_name({typed_record_field, RF, _Type}) -> field_name(RF).
+
+%% A field with no declared default still has one: Erlang itself binds
+%% an omitted field to the literal atom `undefined` (confirmed directly:
+%% `-record(foo,{a,b}). #foo{a=1}` yields `{foo,1,undefined}`, no compile
+%% error) - so this map always has an entry for every declared field,
+%% explicit or implicit, and callers never need to treat "no default"
+%% as a special case.
+collect_record_defaults(Forms) ->
+    lists:foldl(
+      fun(Form, Acc) ->
+              case Form of
+                  {attribute, _Anno, record, {Name, FieldDecls}} ->
+                      Defaults = maps:from_list([field_default(FD) || FD <- FieldDecls]),
+                      maps:put(Name, Defaults, Acc);
+                  _ -> Acc
+              end
+      end, #{}, Forms).
+
+field_default({record_field, Anno, {atom, _, FName}}) -> {FName, {atom, Anno, undefined}};
+field_default({record_field, _, {atom, _, FName}, Default}) -> {FName, Default};
+field_default({typed_record_field, RF, _Type}) -> field_default(RF).
 
 collect_exports(Forms) ->
     lists:foldl(
@@ -78,10 +107,10 @@ collect_exports(Forms) ->
 %% just a {field_read,...} entry in B's own collect_var_uses scan, not a
 %% bare reference). Multiple surviving positions become a multi-accumulator
 %% plan (v1.2); exactly one is the ordinary single-accumulator case.
-try_qualify(Name, Arity, Clauses, Forms, Records) ->
+try_qualify(Name, Arity, Clauses, Forms, Records, Defaults) ->
     Candidates = lists:filtermap(
                    fun(Pos) ->
-                           case try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records) of
+                           case try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records, Defaults) of
                                {ok, AccumPlan} -> {true, AccumPlan};
                                decline -> false
                            end
@@ -116,7 +145,7 @@ check_cross_scalar_collision(Candidates) ->
     lists:foreach(fun(Idxs) -> (length(Idxs) =:= 1) orelse throw(decline) end,
                   maps:values(ByName)).
 
-try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records) ->
+try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records, Defaults) ->
     try
         {PlansRev, RecNameAcc} = classify_clauses(Name, Arity, Pos, Clauses, Forms),
         ClausePlans = lists:reverse(PlansRev),
@@ -128,6 +157,7 @@ try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records) ->
                      {ok, Fs} -> Fs;
                      error -> throw(decline)
                  end,
+        RecordDefaults = maps:get(RecName, Defaults, #{}),
         %% A genuine terminal clause must exist somewhere in the function
         %% (else it's not really a loop), but it need not be one where
         %% THIS accumulator is read - a secondary accumulator can be
@@ -143,9 +173,10 @@ try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records) ->
         TailCalls = [maps:get(tail_call, CP) || CP <- ClausePlans,
                                                  maps:get(kind, CP) =:= recursive],
         EntryCalls = AllCalls -- TailCalls,
-        lists:foreach(fun(C) -> check_full_construction(C, Pos, RecName, Fields) end, EntryCalls),
+        lists:foreach(fun(C) -> check_full_construction(C, Pos, RecName, Fields, RecordDefaults) end,
+                      EntryCalls),
         {ok, #{name => Name, arity => Arity, pos => Pos, rec => RecName,
-               fields => Fields, clause_plans => ClausePlans}}
+               fields => Fields, clause_plans => ClausePlans, defaults => RecordDefaults}}
     catch
         throw:decline -> decline
     end.
@@ -186,17 +217,24 @@ classify_clause(Name, Arity, Pos, {clause, Anno, Patterns, Guard, Body}, RecAcc,
             end
     end.
 
+%% At most one bare occurrence of the accumulator is allowed anywhere in
+%% the clause (Guard or Body, tail position or not) - not just as the
+%% clause's own trailing expression. This is safe in general, not just
+%% for a literal `-> P` return: Phase 2's subst_bare_return/5 is already
+%% a fully generic tree walk that re-boxes wherever it finds the one
+%% remaining bare occurrence (after subst_field_reads/3 has already
+%% consumed every genuine field read), so re-boxing is correct no matter
+%% the bare occurrence's syntactic position - it always reconstructs the
+%% exact value the accumulator would have had there. This is Category B
+%% from the corpus study: a base case that hands the accumulator to a
+%% continuation function (`-> validate(P, ...)`, found via
+%% inets/httpc.erl's header_record/4 and throughout xmerl_scan.erl's
+%% continuation-passing scanner) needs no special-casing at all once the
+%% qualification gate stops assuming the bare occurrence can only be the
+%% clause's own entire trailing expression.
 classify_base(Anno, Patterns, Guard, Body, VName, Uses, RecAcc) ->
-    LastExpr = lists:last(Body),
-    IsBareReturn = case LastExpr of
-                       {var, _, VName} -> true;
-                       _ -> false
-                   end,
     BareCount = length([U || U <- Uses, U =:= bare]),
-    case IsBareReturn of
-        true -> (BareCount =:= 1) orelse throw(decline);
-        false -> (BareCount =:= 0) orelse throw(decline)
-    end,
+    (BareCount =< 1) orelse throw(decline),
     FieldReads = [R || {field_read, R, _F} <- Uses],
     RecAcc2 = unify_recname(RecAcc, FieldReads),
     {#{kind => base, anno => Anno, patterns => Patterns, guard => Guard,
@@ -324,13 +362,19 @@ validate_field_names(#{kind := recursive, var := VName, guard := Guard, body := 
     FieldAtoms = [F || {field_read, _R, F} <- Uses],
     lists:foreach(fun(F) -> lists:member(F, Fields) orelse throw(decline) end, FieldAtoms).
 
-check_full_construction(CallTerm, Pos, RecName, Fields) ->
+%% A field omitted from the construction is fine as long as it has a
+%% default (always true per collect_record_defaults/1's own doc comment -
+%% Erlang implicitly defaults every field to `undefined` even without an
+%% explicit declaration) - only an actually-unknown field name declines.
+check_full_construction(CallTerm, Pos, RecName, Fields, RecordDefaults) ->
     {call, _Anno, _F, Args} = CallTerm,
     ArgP = lists:nth(Pos, Args),
     case ArgP of
         {record, _, RecName2, FieldList} when RecName2 =:= RecName ->
             FieldNames = [FN || {record_field, _, {atom, _, FN}, _} <- FieldList],
-            (lists:sort(FieldNames) =:= lists:sort(Fields)) orelse throw(decline);
+            (FieldNames -- Fields) =:= [] orelse throw(decline),
+            Missing = Fields -- FieldNames,
+            lists:all(fun(F) -> maps:is_key(F, RecordDefaults) end, Missing) orelse throw(decline);
         _ ->
             throw(decline)
     end.
@@ -393,6 +437,15 @@ find_field_expr(FieldList, F) ->
     case [E || {record_field, _, {atom, _, FN}, E} <- FieldList, FN =:= F] of
         [E | _] -> {ok, E};
         [] -> error
+    end.
+
+%% A field omitted from a full construction takes the record's own
+%% declared (or implicit `undefined`) default - never crashes, since
+%% every field always has one (see collect_record_defaults/1).
+field_expr_or_default(FieldList, F, Defaults) ->
+    case find_field_expr(FieldList, F) of
+        {ok, E} -> E;
+        error -> maps:get(F, Defaults)
     end.
 
 %% Replaces every {record_field, Anno, {var,_,VarName}, _RecName, {atom,_,F}}
@@ -526,8 +579,9 @@ splice_entry_args([Arg | Rest], Idx, PosMap) ->
     case maps:find(Idx, PosMap) of
         {ok, AP} ->
             Fields = maps:get(fields, AP),
+            Defaults = maps:get(defaults, AP),
             {record, _, _RecName, FieldList} = Arg,
-            FieldExprs = [begin {ok, E} = find_field_expr(FieldList, F), E end || F <- Fields],
+            FieldExprs = [field_expr_or_default(FieldList, F, Defaults) || F <- Fields],
             FieldExprs ++ Tail;
         error ->
             [Arg | Tail]
@@ -609,13 +663,14 @@ build_args_multi([Arg | Rest], Idx, PosMap, AllSubs, CAnno) ->
     case maps:find(Idx, PosMap) of
         {ok, {CP, AP}} ->
             Fields = maps:get(fields, AP),
+            Defaults = maps:get(defaults, AP),
             VName = maps:get(var, CP),
             ArgKind = maps:get(arg_kind, CP),
             ScalarMap = scalar_map(VName, Fields),
             {Prelude, FieldExprs} =
                 case ArgKind of
-                    {inline, InlinePlan} -> expand_inline(InlinePlan, VName, Fields, ScalarMap, CAnno);
-                    _ -> {[], expand_field_exprs(Arg, VName, Fields, ScalarMap)}
+                    {inline, InlinePlan} -> expand_inline(InlinePlan, VName, Fields, ScalarMap, Defaults, CAnno);
+                    _ -> {[], expand_field_exprs(Arg, VName, Fields, ScalarMap, Defaults)}
                 end,
             FieldExprs1 = [subst_all(E, AllSubs) || E <- FieldExprs],
             Prelude1 = [subst_all(S, AllSubs) || S <- Prelude],
@@ -653,31 +708,42 @@ splice_patterns_multi([Pat | Rest], Idx, PosMap) ->
 %% qualification time), then re-uses the ordinary field-read substitution
 %% machinery on the renamed statements exactly as if they'd been written
 %% directly in the caller.
+%% A field the helper's own reconstruction omits takes the record's
+%% default, exactly like a direct full reconstruction (below) - the
+%% default expression itself needs no renaming/substitution, since it
+%% comes from the -record(...) declaration, not the helper's body.
 expand_inline(#{q := QName, intermediate := IntStmts, int_names := IntNames,
-                field_list := FieldList}, VName, Fields, ScalarMap, _CAnno) ->
+                field_list := FieldList}, VName, Fields, ScalarMap, Defaults, _CAnno) ->
     GensymMap = maps:from_list([{IN, gensym_name(VName, IN)} || IN <- IntNames]),
     RenameMap = maps:put(QName, VName, GensymMap),
     RenamedIntStmts = rename_vars(IntStmts, RenameMap),
     RenamedFieldList = rename_vars(FieldList, RenameMap),
     Prelude = [subst_field_reads(S, VName, ScalarMap) || S <- RenamedIntStmts],
-    FieldExprs = [begin
-                      {ok, Expr} = find_field_expr(RenamedFieldList, F),
-                      subst_field_reads(Expr, VName, ScalarMap)
-                  end || F <- Fields],
+    FieldExprs = [case find_field_expr(RenamedFieldList, F) of
+                       {ok, Expr} -> subst_field_reads(Expr, VName, ScalarMap);
+                       error -> maps:get(F, Defaults)
+                   end || F <- Fields],
     {Prelude, FieldExprs}.
 
 scalar_map(VName, Fields) ->
     maps:from_list([{F, scalar_name(VName, F)} || F <- Fields]).
 
-expand_field_exprs({record, _, _RecName2, FieldList}, VName, Fields, ScalarMap) ->
-    [begin
-         {ok, Expr} = find_field_expr(FieldList, F),
-         subst_field_reads(Expr, VName, ScalarMap)
-     end || F <- Fields];
-expand_field_exprs({record, Anno, {var, _, _}, _RecName2, FieldList}, VName, Fields, ScalarMap) ->
+%% A field omitted from a full reconstruction takes the record's default
+%% (Category A); an omitted field in a partial update keeps its current
+%% scalar value instead (Erlang's own #rec{a=X} update semantics - not a
+%% default at all, so this clause is unaffected by Defaults).
+expand_field_exprs({record, _, _RecName2, FieldList}, VName, Fields, ScalarMap, Defaults) ->
+    [substituted_field_expr_or_default(FieldList, F, Defaults, VName, ScalarMap) || F <- Fields];
+expand_field_exprs({record, Anno, {var, _, _}, _RecName2, FieldList}, VName, Fields, ScalarMap, _Defaults) ->
     [case find_field_expr(FieldList, F) of
          {ok, Expr} -> subst_field_reads(Expr, VName, ScalarMap);
          error -> {var, Anno, maps:get(F, ScalarMap)}
      end || F <- Fields];
-expand_field_exprs({var, Anno, _}, _VName, Fields, ScalarMap) ->
+expand_field_exprs({var, Anno, _}, _VName, Fields, ScalarMap, _Defaults) ->
     [{var, Anno, maps:get(F, ScalarMap)} || F <- Fields].
+
+substituted_field_expr_or_default(FieldList, F, Defaults, VName, ScalarMap) ->
+    case find_field_expr(FieldList, F) of
+        {ok, Expr} -> subst_field_reads(Expr, VName, ScalarMap);
+        error -> maps:get(F, Defaults)
+    end.
