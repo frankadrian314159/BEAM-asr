@@ -16,8 +16,17 @@
 %% and a base case may hand the accumulator to a continuation function
 %% instead of returning it bare, since subst_bare_return/5 already
 %% re-boxes wherever the accumulator's one remaining bare occurrence
-%% falls, not just in trailing position (classify_base/7). See BEAM-asr
-%% design notes and README.md for the full qualification/rewrite spec.
+%% falls, not just in trailing position (classify_base/7). v1.5 adds two
+%% more corpus-study fixes: a clause pattern may bind the whole
+%% accumulator and destructure a field right in the head, e.g.
+%% `S=#rec{col=C}` (extract_accum_pat/1, narrow slice - every field
+%% sub-pattern must be a wildcard or plain-var binding, not a literal);
+%% and a reconstruction may happen in a single intermediate binding
+%% ahead of the tail call rather than directly in its own argument
+%% position, e.g. the shape behind xmerl's `?bump_col(N)` macro
+%% (try_hoist_single_binding/4, narrow slice - a chain of exactly one,
+%% no helper calls). See BEAM-asr design notes and README.md for the
+%% full qualification/rewrite spec.
 -module(asr_transform).
 -export([parse_transform/2]).
 
@@ -170,8 +179,16 @@ try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records, Defaults) ->
         lists:foreach(fun(CP) -> check_collision(CP, Fields) end, ClausePlans),
         lists:foreach(fun(CP) -> validate_field_names(CP, Fields) end, ClausePlans),
         AllCalls = find_calls(Name, Arity, Forms),
-        TailCalls = [maps:get(tail_call, CP) || CP <- ClausePlans,
-                                                 maps:get(kind, CP) =:= recursive],
+        %% orig_tail_call (not tail_call) here deliberately: find_calls
+        %% scans the unmodified Forms, so this subtraction needs the
+        %% tail call exactly as it appears there. A hoisted clause's
+        %% `tail_call` has already been rewritten (Category F splices
+        %% the reconstruction in at the accumulator position), so it no
+        %% longer matches structurally and the subtraction would
+        %% silently fail to remove the genuine tail-call site, leaving
+        %% it to be misclassified as an entry call.
+        TailCalls = [maps:get(orig_tail_call, CP) || CP <- ClausePlans,
+                                                       maps:get(kind, CP) =:= recursive],
         EntryCalls = AllCalls -- TailCalls,
         lists:foreach(fun(C) -> check_full_construction(C, Pos, RecName, Fields, RecordDefaults) end,
                       EntryCalls),
@@ -180,6 +197,47 @@ try_qualify_at(Name, Arity, Pos, Clauses, Forms, Records, Defaults) ->
     catch
         throw:decline -> decline
     end.
+
+%% -- accumulator pattern extraction (v1.5, Category D) -------------------
+
+%% Recognizes either a bare variable pattern, or a narrow-safe head-alias
+%% pattern `Var = #rec{field1 = SubVar1, field2 = _, ...}` (binding the
+%% whole accumulator AND destructuring some of its fields right in the
+%% clause head - e.g. `S=#xmerl_scanner{col = C}`, found throughout
+%% xmerl_scan.erl and httpc.erl in the corpus study). Every field
+%% sub-pattern must be a wildcard or a fresh plain-variable binding; a
+%% literal/nested constant sub-pattern (acting as an implicit guard, e.g.
+%% `#http_request_h{host = undefined}`) is NOT narrow-safe and returns
+%% none, same as today's decline for anything beyond a bare variable -
+%% that shape needs per-clause field patterns at rewrite time, out of
+%% scope here. Returns {ok, VName, RecNameOrUndefined, AliasFields} |
+%% none, where AliasFields is a #{AliasVar => FieldAtom} map (empty for
+%% a bare var).
+extract_accum_pat({var, _, V}) when V =/= '_' ->
+    {ok, V, undefined, #{}};
+extract_accum_pat({match, _, {var, _, V}, {record, _, RecName, PatFields}}) when V =/= '_' ->
+    extract_alias_fields(V, RecName, PatFields);
+extract_accum_pat({match, _, {record, _, RecName, PatFields}, {var, _, V}}) when V =/= '_' ->
+    extract_alias_fields(V, RecName, PatFields);
+extract_accum_pat(_) ->
+    none.
+
+extract_alias_fields(V, RecName, PatFields) ->
+    try
+        AliasList = lists:filtermap(fun alias_field/1, PatFields),
+        AliasVars = [AV || {AV, _F} <- AliasList],
+        (length(AliasVars) =:= length(lists:usort(AliasVars))) orelse throw(not_narrow),
+        {ok, V, RecName, maps:from_list(AliasList)}
+    catch
+        throw:not_narrow -> none
+    end.
+
+alias_field({record_field, _, {atom, _, _F}, {var, _, '_'}}) ->
+    false;
+alias_field({record_field, _, {atom, _, F}, {var, _, AliasV}}) when AliasV =/= '_' ->
+    {true, {AliasV, F}};
+alias_field(_) ->
+    throw(not_narrow).
 
 %% -- per-clause classification ------------------------------------------
 
@@ -201,17 +259,26 @@ classify_clause(Name, Arity, Pos, {clause, Anno, Patterns, Guard, Body}, RecAcc,
         true ->
             classify_recursive(Pos, Anno, Patterns, Guard, Body, PatP, LastExpr, RecAcc, Name, Forms);
         false ->
-            case PatP of
-                {var, _, VName} when VName =/= '_' ->
-                    Uses = collect_var_uses(VName, {Guard, Body}),
+            case extract_accum_pat(PatP) of
+                {ok, VName, RecName2, AliasFields} ->
+                    %% Every aliased field is treated as a field-read
+                    %% regardless of whether it's textually used later -
+                    %% harmless if unused (forces `base` instead of
+                    %% `unrelated`, which is always safe), but required
+                    %% if used: leaving such a clause `unrelated` would
+                    %% wipe its own pattern to wildcards at rewrite time
+                    %% while the body still references the alias var,
+                    %% an unbound-variable compile error.
+                    Uses = collect_var_uses(VName, {Guard, Body})
+                        ++ [{field_read, RecName2, F} || {_AliasV, F} <- maps:to_list(AliasFields)],
                     case Uses of
                         [] ->
                             {#{kind => unrelated, anno => Anno, patterns => Patterns,
                                guard => Guard, body => Body}, RecAcc};
                         _ ->
-                            classify_base(Anno, Patterns, Guard, Body, VName, Uses, RecAcc)
+                            classify_base(Anno, Patterns, Guard, Body, VName, AliasFields, Uses, RecAcc)
                     end;
-                _ ->
+                none ->
                     {#{kind => unrelated, anno => Anno, patterns => Patterns,
                        guard => Guard, body => Body}, RecAcc}
             end
@@ -232,26 +299,46 @@ classify_clause(Name, Arity, Pos, {clause, Anno, Patterns, Guard, Body}, RecAcc,
 %% continuation-passing scanner) needs no special-casing at all once the
 %% qualification gate stops assuming the bare occurrence can only be the
 %% clause's own entire trailing expression.
-classify_base(Anno, Patterns, Guard, Body, VName, Uses, RecAcc) ->
+classify_base(Anno, Patterns, Guard, Body, VName, AliasFields, Uses, RecAcc) ->
     BareCount = length([U || U <- Uses, U =:= bare]),
     (BareCount =< 1) orelse throw(decline),
     FieldReads = [R || {field_read, R, _F} <- Uses],
     RecAcc2 = unify_recname(RecAcc, FieldReads),
     {#{kind => base, anno => Anno, patterns => Patterns, guard => Guard,
-       body => Body, var => VName}, RecAcc2}.
+       body => Body, var => VName, alias_fields => AliasFields}, RecAcc2}.
 
 classify_recursive(Pos, Anno, Patterns, Guard, Body, PatP, TailCall, RecAcc, Name, Forms) ->
-    VName = case PatP of
-                {var, _, V} when V =/= '_' -> V;
-                _ -> throw(decline)
-            end,
-    {call, CAnno, CF, Args} = TailCall,
+    {VName, RecNameFromPat, AliasFields} =
+        case extract_accum_pat(PatP) of
+            {ok, V, RN, AF} -> {V, RN, AF};
+            none -> throw(decline)
+        end,
+    RecAcc0 = case RecNameFromPat of
+                  undefined -> RecAcc;
+                  RN2 -> unify_recname(RecAcc, [RN2])
+              end,
+    %% Category F (narrow slice, v1.5): hoist a single intermediate
+    %% binding `Vk = VName#rec{...}` that feeds the tail call's own
+    %% accumulator position bare and nowhere else - the common shape
+    %% behind macros like xmerl's own `?bump_col(N)`, which expands to
+    %% `S = S0#xmerl_scanner{col = S0#xmerl_scanner.col + N}` ahead of
+    %% the actual tail call. Once hoisted, the rest of this function
+    %% treats the clause exactly as if that reconstruction had been
+    %% written directly at the tail-call site (the only shape recognized
+    %% before this fix) - a pure preprocessing step, not a new rewrite
+    %% path, so it composes for free with every ArgKind below.
+    {Body1, TailCall1} =
+        case try_hoist_single_binding(Pos, Body, TailCall, VName) of
+            {ok, NonTailBody2, NewTailCall} -> {NonTailBody2 ++ [NewTailCall], NewTailCall};
+            none -> {Body, TailCall}
+        end,
+    {call, CAnno, CF, Args} = TailCall1,
     ArgP = lists:nth(Pos, Args),
     OtherArgs = lists:sublist(Args, 1, Pos - 1) ++ lists:nthtail(Pos, Args),
-    NonTailBody = lists:sublist(Body, 1, length(Body) - 1),
+    NonTailBody = lists:sublist(Body1, 1, length(Body1) - 1),
     Uses1 = collect_var_uses(VName, {Guard, NonTailBody, OtherArgs}),
     (lists:all(fun(U) -> U =/= bare end, Uses1)) orelse throw(decline),
-    RecAcc1 = unify_recname(RecAcc, [R || {field_read, R, _F} <- Uses1]),
+    RecAcc1 = unify_recname(RecAcc0, [R || {field_read, R, _F} <- Uses1]),
     {ArgKind, RecAcc2} =
         case ArgP of
             {record, _, RecName2, FieldList} ->
@@ -272,7 +359,7 @@ classify_recursive(Pos, Anno, Patterns, Guard, Body, PatP, TailCall, RecAcc, Nam
                 {InlinePlan, RA1} = try_inline(HelperName, Forms, RecAcc1),
                 IntNames = maps:get(int_names, InlinePlan),
                 GensymNames = [gensym_name(VName, IN) || IN <- IntNames],
-                ClauseNames = sets:to_list(collect_var_names({Patterns, Guard, Body})),
+                ClauseNames = sets:to_list(collect_var_names({Patterns, Guard, Body1})),
                 lists:foreach(fun(GN) -> (not lists:member(GN, ClauseNames)) orelse throw(decline) end,
                               GensymNames),
                 {{inline, InlinePlan}, RA1};
@@ -280,9 +367,55 @@ classify_recursive(Pos, Anno, Patterns, Guard, Body, PatP, TailCall, RecAcc, Nam
                 throw(decline)
         end,
     CP = #{kind => recursive, anno => Anno, patterns => Patterns, guard => Guard,
-           body => Body, var => VName, tail_call => TailCall, tail_anno => CAnno,
-           tail_f => CF, arg_kind => ArgKind},
+           body => Body1, var => VName, tail_call => TailCall1, orig_tail_call => TailCall,
+           tail_anno => CAnno, tail_f => CF, arg_kind => ArgKind, alias_fields => AliasFields},
     {CP, RecAcc2}.
+
+%% Finds a statement `Vk = VName#rec{...}` (or `Vk = #rec{...}` full
+%% reconstruction) in the clause's non-tail-call body, where Vk is
+%% exactly what the tail call passes bare at its own accumulator
+%% position and nowhere else in the clause - i.e. a single-use,
+%% single-link rename of the accumulator's next value. Requires the
+%% reconstruction derive directly from VName itself (not from some
+%% earlier already-hoisted variable); chains of length > 1 are out of
+%% scope for this narrow slice. Returns {ok, RemainingStmts, NewTailCall}
+%% with RHS spliced directly into the tail call's own argument list, or
+%% none if the shape doesn't match - always safe to fall through to,
+%% since the caller's own existing checks run unchanged afterward.
+try_hoist_single_binding(Pos, Body, TailCall, VName) ->
+    {call, CAnno, CF, Args} = TailCall,
+    ArgP = lists:nth(Pos, Args),
+    NonTailBody = lists:sublist(Body, 1, length(Body) - 1),
+    case ArgP of
+        {var, _, Vk} when Vk =/= VName, Vk =/= '_' ->
+            case extract_hoistable_binding(Vk, VName, NonTailBody) of
+                {ok, RHS, NonTailBody2} ->
+                    OtherArgs = lists:sublist(Args, 1, Pos - 1) ++ lists:nthtail(Pos, Args),
+                    case collect_var_uses(Vk, {NonTailBody2, OtherArgs}) of
+                        [] ->
+                            NewArgs = lists:sublist(Args, 1, Pos - 1) ++ [RHS] ++ lists:nthtail(Pos, Args),
+                            {ok, NonTailBody2, {call, CAnno, CF, NewArgs}};
+                        _ ->
+                            none
+                    end;
+                none ->
+                    none
+            end;
+        _ ->
+            none
+    end.
+
+extract_hoistable_binding(Vk, VName, Stmts) ->
+    case [S || S = {match, _, {var, _, V}, _RHS} <- Stmts, V =:= Vk] of
+        [{match, _, _, RHS} = Stmt] ->
+            case RHS of
+                {record, _, _RecName2, _FieldList} -> {ok, RHS, Stmts -- [Stmt]};
+                {record, _, {var, _, VName}, _RecName2, _FieldList} -> {ok, RHS, Stmts -- [Stmt]};
+                _ -> none
+            end;
+        _ ->
+            none
+    end.
 
 %% -- interprocedural inlining (one level) --------------------------------
 
@@ -351,15 +484,22 @@ check_collision(#{var := VName, patterns := Patterns, guard := Guard, body := Bo
     lists:foreach(fun(SN) -> (not lists:member(SN, AllNames)) orelse throw(decline) end,
                   ScalarNames).
 
+%% Alias-derived field atoms (Category D) come straight from the source
+%% record pattern, not from an expression collect_var_uses can see - and
+%% since parse_transform runs before erl_expand_records, an undeclared
+%% field name there is still syntactically valid Forms at this point, not
+%% yet a compile error (same reasoning as check_full_construction/5's own
+%% explicit validation) - so they're checked here explicitly too, not
+%% assumed safe just because the source parsed.
 validate_field_names(#{kind := unrelated}, _Fields) -> ok;
-validate_field_names(#{kind := base, var := VName, guard := Guard, body := Body}, Fields) ->
+validate_field_names(#{kind := base, var := VName, guard := Guard, body := Body} = CP, Fields) ->
     Uses = collect_var_uses(VName, {Guard, Body}),
-    FieldAtoms = [F || {field_read, _R, F} <- Uses],
+    FieldAtoms = [F || {field_read, _R, F} <- Uses] ++ maps:values(maps:get(alias_fields, CP, #{})),
     lists:foreach(fun(F) -> lists:member(F, Fields) orelse throw(decline) end, FieldAtoms);
 validate_field_names(#{kind := recursive, var := VName, guard := Guard, body := Body,
-                        tail_call := TailCall}, Fields) ->
+                        tail_call := TailCall} = CP, Fields) ->
     Uses = collect_var_uses(VName, {Guard, Body, TailCall}),
-    FieldAtoms = [F || {field_read, _R, F} <- Uses],
+    FieldAtoms = [F || {field_read, _R, F} <- Uses] ++ maps:values(maps:get(alias_fields, CP, #{})),
     lists:foreach(fun(F) -> lists:member(F, Fields) orelse throw(decline) end, FieldAtoms).
 
 %% A field omitted from the construction is fine as long as it has a
@@ -619,8 +759,9 @@ rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
                           Fields = maps:get(fields, AP),
                           RecName = maps:get(rec, AP),
                           ScalarMap = scalar_map(VName, Fields),
-                          G1 = subst_field_reads(G, VName, ScalarMap),
-                          B1 = subst_field_reads(B, VName, ScalarMap),
+                          AliasMap = alias_rename_map(maps:get(alias_fields, CP, #{}), ScalarMap),
+                          G1 = rename_vars(subst_field_reads(G, VName, ScalarMap), AliasMap),
+                          B1 = rename_vars(subst_field_reads(B, VName, ScalarMap), AliasMap),
                           B2 = subst_bare_return(B1, VName, RecName, Fields, ScalarMap),
                           {G1, B2}
                   end
@@ -629,8 +770,7 @@ rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
     {clause, Anno, NewPatterns, NewGuard, NewBody}.
 
 rewrite_recursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
-    AllSubs = [{maps:get(var, CP), scalar_map(maps:get(var, CP), maps:get(fields, AP))}
-               || {CP, AP} <- Pairs],
+    AllSubs = build_all_subs(Pairs),
     {CP1, _} = hd(Pairs),
     TailCall = maps:get(tail_call, CP1),
     {call, CAnno, CF, Args} = TailCall,
@@ -643,9 +783,22 @@ rewrite_recursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
     NewPatterns = splice_patterns_multi(Patterns, Pairs),
     {clause, Anno, NewPatterns, NewGuard, NewBody}.
 
+%% Per accumulator: {VName, ScalarMap, AliasMap}, ScalarMap for ordinary
+%% `VName#rec.field` reads, AliasMap for Category D's head-alias
+%% variables (e.g. `C` standing in for `S.col` after `S=#rec{col=C}`) -
+%% both are pure renames/substitutions over the same clause-wide scope,
+%% so folding them together here covers every accumulator uniformly.
+build_all_subs(Pairs) ->
+    [begin
+         ScalarMap = scalar_map(maps:get(var, CP), maps:get(fields, AP)),
+         AliasMap = alias_rename_map(maps:get(alias_fields, CP, #{}), ScalarMap),
+         {maps:get(var, CP), ScalarMap, AliasMap}
+     end || {CP, AP} <- Pairs].
+
 subst_all(Term, AllSubs) ->
-    lists:foldl(fun({VName, ScalarMap}, T) -> subst_field_reads(T, VName, ScalarMap) end,
-                Term, AllSubs).
+    lists:foldl(fun({VName, ScalarMap, AliasMap}, T) ->
+                        rename_vars(subst_field_reads(T, VName, ScalarMap), AliasMap)
+                end, Term, AllSubs).
 
 %% Walks the original Args/Patterns list once (by position), splicing
 %% each accumulator's own N-wide expansion in at its own position and
@@ -727,6 +880,13 @@ expand_inline(#{q := QName, intermediate := IntStmts, int_names := IntNames,
 
 scalar_map(VName, Fields) ->
     maps:from_list([{F, scalar_name(VName, F)} || F <- Fields]).
+
+%% Category D: an alias variable bound in the clause head (e.g. `C` from
+%% `S=#rec{col=C}`) renames directly to the same scalar name an ordinary
+%% `S#rec.col` read would - the two are equivalent once S no longer
+%% exists as a single value.
+alias_rename_map(AliasFields, ScalarMap) ->
+    maps:from_list([{AliasV, maps:get(F, ScalarMap)} || {AliasV, F} <- maps:to_list(AliasFields)]).
 
 %% A field omitted from a full reconstruction takes the record's default
 %% (Category A); an omitted field in a partial update keeps its current

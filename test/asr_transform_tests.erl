@@ -45,6 +45,22 @@ base_handoff_test() ->
     ?assertEqual(fixture_base_handoff:run(500), fixture_base_handoff_asr:run(500)),
     assert_qualified(fixture_base_handoff, loop, 3, 4).
 
+%% Head-alias pattern (v1.5, Category D from the corpus study): the
+%% clause's own pattern binds the whole accumulator AND destructures a
+%% field, right in the head (`P=#pt{tag=T}`) - found via xmerl_scan.erl's
+%% `S=#xmerl_scanner{col=C}` idiom and httpc.erl's validate_headers/3.
+alias_pattern_test() ->
+    ?assertEqual(fixture_alias_pattern:run(500), fixture_alias_pattern_asr:run(500)),
+    assert_qualified(fixture_alias_pattern, loop, 3, 5).
+
+%% Hoisted intermediate binding (v1.5, Category F narrow slice): the
+%% reconstruction happens in an intermediate statement rather than
+%% directly at the tail call's own argument position - mirrors
+%% xmerl_scan.erl's `?bump_col(N)` macro.
+hoisted_binding_test() ->
+    ?assertEqual(fixture_hoisted_binding:run(500), fixture_hoisted_binding_asr:run(500)),
+    assert_qualified(fixture_hoisted_binding, loop, 3, 4).
+
 %% Interprocedural inlining (v1.1): the reconstruction lives in a
 %% separate one-level-inlinable helper function, not literally in the
 %% tail call's own argument.
@@ -122,6 +138,16 @@ base_double_bare_declines_test() ->
     R = fixture_base_double_bare:run(500),
     ?assertEqual({{pt, 500.0, 1000.0}, {pt, 500.0, 1000.0}}, R),
     assert_declined(fixture_base_double_bare).
+
+alias_pattern_literal_declines_test() ->
+    R = fixture_alias_pattern_literal_declines:run(500),
+    ?assertEqual({pt, 500.0, 1000.0, fixed}, R),
+    assert_declined(fixture_alias_pattern_literal_declines).
+
+hoisted_binding_escapes_declines_test() ->
+    R = fixture_hoisted_binding_escapes_declines:run(500),
+    ?assertEqual({pt, 500.0, 1000.0}, R),
+    assert_declined(fixture_hoisted_binding_escapes_declines).
 
 %% ---------------------------------------------------------------------
 %% Helpers

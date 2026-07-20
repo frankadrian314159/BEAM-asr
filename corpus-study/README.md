@@ -8,7 +8,7 @@ study (`../../FOL/fol/docs/cgo2027/corpus-study/`) and cpython-asr's
 (`../../cpython-asr/corpus-study/`): a syntactic-shape Pass 1 (an
 upper-bound proxy) followed by a gate-faithful Pass 2 that runs the
 *real* `asr_transform.erl` as a black-box oracle, never a
-re-implementation that could drift from the actual v1–v1.4 rules.
+re-implementation that could drift from the actual v1–v1.5 rules.
 
 **Update (v1.4)**: this study's own Category A and Category B findings
 (below) were fed back into `asr_transform.erl` as two targeted fixes —
@@ -21,6 +21,28 @@ updated transform now shows 2 of 41 candidates qualifying:
 B). The numbers below reflect that re-run; the original 0-of-41 result
 is what motivated the fixes in the first place, not an error corrected
 after the fact.
+
+**Update (v1.5)**: a further analysis pass, instrumenting the real
+transform to report *why* each remaining candidate declines (not just
+true/false), surfaced two more fixable shapes in the still-declining
+`record_strong` sites — a clause pattern that binds the whole
+accumulator *and* destructures a field right in the head (`Category D`,
+e.g. `S=#xmerl_scanner{col=C}`), and a reconstruction that happens in an
+intermediate binding rather than directly at the tail call's own
+argument position (`Category F` narrow slice, e.g. xmerl's own
+`?bump_col(N)` macro). Both were implemented, with clean fixtures and
+EUnit coverage proving the mechanisms correct in isolation (see
+`README.md`'s Status table). **Re-running this study against the v1.5
+transform still shows 2 of 41 qualifying — unchanged.** This is not a
+bug: every site Category D/F were expected to help (`strip/3`,
+`xml_vsn/4`, `fetch_DTD/2`, `scan_comment1/5`, `initial_state/2`,
+`scan_entity_value/7`, `validate_headers/3`, `get_options/2`) turned out
+to hit a *second, independent* blocker in some other clause of the same
+function once the first one was cleared — see "Two new categories,
+implemented but not yet reflected in this corpus" below for exactly
+which blocker each site actually hit. The fixes are real and the
+mechanisms are verified; this corpus's specific 8 candidate functions
+just each needed more than one fix simultaneously to fully qualify.
 
 ## The analyzer
 
@@ -192,6 +214,49 @@ manual-repro discipline as the original category read); the honest
 claim is narrower than "Category B is fixed" — it's "the base-handoff
 *shape itself* no longer blocks qualification," which is exactly what
 `fixture_base_handoff.erl`'s EUnit coverage verifies in isolation.
+
+## Two new categories (v1.5): implemented, but not reflected in this corpus's numbers
+
+Following the "why only 1 of 8" thread above, the still-declining
+`record_strong` sites were re-audited using an instrumented copy of the
+real transform that reports *why* each candidate declines (not just
+true/false) instead of relying on a re-implementation. This surfaced
+two more fixable shapes, both implemented in v1.5:
+
+| Category | Shape | Example | Fix |
+|---|---|---|---|
+| **D — head-alias pattern** | The clause's own pattern binds the whole accumulator *and* destructures a field, right in the head, instead of a bare variable — `S=#xmerl_scanner{col=C}`. `classify_recursive`'s `VName` extraction only accepted a bare `{var,_,V}`. | `xml_vsn/4`, `fetch_DTD/2`, `scan_comment1/5`, `strip/3` (xmerl_scan.erl); `validate_headers/3`, `get_options/2` (httpc.erl) | `extract_accum_pat/1` now also recognizes the alias shape when every field sub-pattern is a wildcard or a fresh plain-variable binding (narrow slice — a literal sub-pattern like `#http_request_h{host=undefined}` is an implicit guard and stays out of scope, correctly still declining). |
+| **F — hoisted intermediate binding (narrow slice)** | The reconstruction happens in an intermediate statement, not directly at the tail call's own argument position — the shape behind xmerl's own `?bump_col(N)` macro (`S = S0#xmerl_scanner{col = S0#xmerl_scanner.col+N}` ahead of the tail call). | `initial_state/2`, `scan_entity_value/7` (xmerl_scan.erl) | `try_hoist_single_binding/4` splices a single-use `Vk = VName#rec{...}` statement directly into the tail call's own argument position before the rest of qualification runs — a chain of length exactly one; a helper call anywhere in the chain (see below) stays out of scope. |
+
+Both are verified correct in isolation: `fixture_alias_pattern.erl`/
+`fixture_hoisted_binding.erl` (positive, arity-change + runtime-equality
+checked) and `fixture_alias_pattern_literal_declines.erl`/
+`fixture_hoisted_binding_escapes_declines.erl` (negative boundary
+cases) in `../test/`.
+
+**Re-running this study against v1.5 still shows 2 of 41 qualifying —
+the same 2 as v1.4.** Re-diagnosing each of the 8 sites above against
+the real (fixed) transform shows why: every one hits a *second*,
+independent blocker in some other clause of the same function, once
+the alias-pattern or hoisting blocker was cleared:
+
+| Site | Second blocker | Detail |
+|---|---|---|
+| `xml_vsn/4` | Intra-clause `case` (pre-existing, documented v1 limitation) | Its last clause's body is a bare `case ... end`, not a literal tail call, so it's classified as a base clause; inside that case, the accumulator is used bare twice (once in the untaken branch's `?fatal(...,S)`), exceeding the one-bare-occurrence budget. Nothing to do with Category D. |
+| `strip/3` | Category E — indirect entry construction (not implemented) | `strip/2`'s own body is `strip(Str,S,all)` — an entry call to `strip/3` where the record arrives as an already-bound variable, not a literal `#rec{...}` at the call site. `check_full_construction` can't see through that (flagged as future work when Category D/E/F were first identified; only D and F were in scope this round). |
+| `fetch_DTD/2` | A separate clause with genuinely multiple bare accumulator uses | `fetch_DTD/2`'s third clause passes the accumulator bare into `fetch_and_parse/3` inside a `case`, more than once across its branches — unrelated to the alias-pattern clause Category D fixed. |
+| `scan_comment1/5`, `initial_state/2`, `scan_entity_value/7` | Accumulator passed bare to an opaque helper (interprocedural, out of scope) | E.g. `initial_state/2`: `S1 = event_state(ES, S#xmerl_scanner{event_fun=F}), initial_state(T, S1)` — `event_state/2` receives the accumulator as an extra argument alongside other data; verifying it doesn't leak/misuse it would need real interprocedural purity analysis, well beyond the "one pure reconstruction, one hop" scope Category F's narrow slice deliberately kept to. |
+| `validate_headers/3`, `get_options/2` | Category D's own literal-sub-pattern boundary (by design) | `validate_headers/3`'s recursive clause pattern is `RequestHeaders=#http_request_h{host=undefined}` — a literal, not a plain-var binding, so it's correctly outside the narrow D slice (the harder "per-clause field pattern" variant would be needed, not attempted here). |
+
+None of this is a defect in the v1.5 implementation — each mechanism
+does exactly what it was designed to do, confirmed by dedicated
+fixtures. It's a genuine finding about this corpus: real OTP functions
+this size (7–40 clauses) tend to accumulate more than one
+qualification-blocking idiom at once, so a single targeted fix rarely
+flips a whole function on its own. Category E (indirect entry
+construction) and full interprocedural helper-call tracing remain
+unimplemented and are the more likely next source of real movement in
+this specific corpus's numbers.
 
 ## Honest caveats
 
