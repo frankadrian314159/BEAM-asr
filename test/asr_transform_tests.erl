@@ -29,6 +29,27 @@ guards_test() ->
                  fixture_guards_asr:run(12345)),
     assert_qualified(fixture_guards, loop, 3, 4).
 
+%% Interprocedural inlining (v1.1): the reconstruction lives in a
+%% separate one-level-inlinable helper function, not literally in the
+%% tail call's own argument.
+inline_with_bindings_test() ->
+    ?assertEqual(fixture_inline:run(500), fixture_inline_asr:run(500)),
+    assert_qualified(fixture_inline, loop, 3, 6).
+
+inline_direct_test() ->
+    ?assertEqual(fixture_inline_direct:run(500), fixture_inline_direct_asr:run(500)),
+    assert_qualified(fixture_inline_direct, loop, 3, 4).
+
+%% Multi-accumulator (v1.2): two record accumulators threaded through the
+%% same recursion simultaneously.
+multi_symmetric_test() ->
+    ?assertEqual(fixture_multi_symmetric:run(500), fixture_multi_symmetric_asr:run(500)),
+    assert_qualified(fixture_multi_symmetric, loop, 4, 6).
+
+multi_asymmetric_test() ->
+    ?assertEqual(fixture_multi_asymmetric:run(500), fixture_multi_asymmetric_asr:run(500)),
+    assert_qualified(fixture_multi_asymmetric, loop, 4, 7).
+
 %% ---------------------------------------------------------------------
 %% Negative / abort-safe cases: the transform must decline cleanly and
 %% leave the function's original arity and behavior completely intact.
@@ -55,6 +76,31 @@ name_collision_declines_test() ->
     R = fixture_name_collision:run(500),
     ?assertEqual({500, 1000}, {pt_a(R), pt_b(R)}),
     assert_declined(fixture_name_collision).
+
+inline_guarded_helper_declines_test() ->
+    R = fixture_inline_guarded_helper:run(500),
+    ?assertEqual({500, 1000}, {pt_a(R), pt_b(R)}),
+    assert_declined(fixture_inline_guarded_helper).
+
+inline_multiclause_helper_declines_test() ->
+    R = fixture_inline_multiclause_helper:run(500),
+    ?assertEqual({500, 1000}, {pt_a(R), pt_b(R)}),
+    assert_declined(fixture_inline_multiclause_helper).
+
+inline_nested_declines_test() ->
+    R = fixture_inline_nested:run(500),
+    ?assertEqual({500, 1000}, {pt_a(R), pt_b(R)}),
+    assert_declined(fixture_inline_nested).
+
+inline_temp_collision_declines_test() ->
+    R = fixture_inline_temp_collision:run(500),
+    ?assertEqual({500, 0}, {pt_a(R), pt_b(R)}),
+    assert_declined(fixture_inline_temp_collision).
+
+multi_scalar_collision_declines_test() ->
+    R = fixture_multi_scalar_collision:run(500),
+    ?assertEqual(1000, R),
+    assert_declined(fixture_multi_scalar_collision).
 
 %% ---------------------------------------------------------------------
 %% Helpers
