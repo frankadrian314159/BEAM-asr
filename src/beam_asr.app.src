@@ -1,0 +1,13 @@
+{application, beam_asr, [
+    {description, "Aggregate Scalar Replacement for Erlang: a parse_transform that unboxes a tail-recursive record accumulator into scalar arguments, re-boxing only at the base case."},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+ ]}.
