@@ -95,6 +95,16 @@ indirect_entry_update_test() ->
     ?assertEqual(fixture_indirect_entry_update:run(500), fixture_indirect_entry_update_asr:run(500)),
     assert_qualified(fixture_indirect_entry_update, loop, 3, 4).
 
+%% Embedded self-call inside a case-wrapped base clause (v1.6 fix,
+%% found while benchmarking xmerl_scan.erl's real xml_vsn/4): the
+%% clause's own trailing form is a case expression, not a literal tail
+%% call, so it's classified base - but one of its branches is itself a
+%% recursive call whose own accumulator argument (an update expression)
+%% still needs splicing, exactly like a genuine external entry call.
+case_embedded_selfcall_test() ->
+    ?assertEqual(fixture_case_embedded_selfcall:run(500), fixture_case_embedded_selfcall_asr:run(500)),
+    assert_qualified(fixture_case_embedded_selfcall, loop, 3, 4).
+
 %% Interprocedural inlining (v1.1): the reconstruction lives in a
 %% separate one-level-inlinable helper function, not literally in the
 %% tail call's own argument.

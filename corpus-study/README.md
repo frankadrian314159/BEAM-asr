@@ -293,6 +293,42 @@ needed Category E's update-expression shape at its own entry call
 discovered only once the update-expression-transparency fix got far
 enough to expose it as the *next* blocker.
 
+## A methodology gap this study's own oracle had: qualifying isn't compiling
+
+`analyzer/asr_gate_check.erl`'s "qualifies" signal only ever checked
+whether the target function's *arity changed* after running the real
+transform - never whether the resulting Forms actually *compile*. This
+was a real gap, not a hypothetical one: building `xml_vsn/4` into a
+standalone benchmark (`../benchmarks/README.md`) - the full real
+function, extracted verbatim rather than just gate-checked in place -
+surfaced a genuine rewrite bug undetected by "qualifies=true" alone.
+`xml_vsn/4`'s last clause is a `case` expression with one branch that
+recurses (`xml_vsn(T, S#xmerl_scanner{col=...}, Delim, [H|Acc])`); since
+that clause's own trailing form is the `case`, not a literal tail call,
+it's classified as a base clause, and nothing in the rewrite pass
+updated that *embedded* self-call to the function's new arity - a
+`function xml_vsn/4 undefined` compile error, not a wrong-answer bug,
+but a real failure `asr_gate_check.erl`'s arity-only check couldn't see
+(the top-level function's own arity had already changed correctly by
+the time this embedded call was reached). Fixed alongside a second,
+related gap the same investigation uncovered: `subst_bare_return/5`
+didn't share `collect_var_uses/3`'s own update-expression awareness, so
+it would replace an update expression's accumulator base with a
+redundant full reconstruction instead of reconstructing the update
+directly - technically correct in isolation, but it turned the
+embedded self-call's own argument into an opaque expression the splice
+logic couldn't read fields back off of efficiently. Both fixes are in
+`asr_transform.erl` (see its module docstring) with a dedicated
+regression fixture (`fixture_case_embedded_selfcall.erl`) in `../test/`.
+All four of this study's v1.6-unlocked real functions
+(`validate_headers/3`, `xml_vsn/4`, `scan_system_literal/4`, `strip/3`)
+are now verified to a stronger bar than "qualifies": each one compiles,
+runs, and produces bit-identical output to its untransformed original
+inside a dedicated benchmark module extracted verbatim from Erlang/OTP.
+`asr_gate_check.erl` itself is unchanged (still arity-only) - this gap
+is noted here for anyone relying on its "qualifies" column as a
+stronger guarantee than it actually provides.
+
 ## Honest caveats
 
 - **Small corpus, real code, not cherry-picked for hits** — 30 files

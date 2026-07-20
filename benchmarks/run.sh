@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Compiles and runs all 14 ported benchmarks.
+# Compiles and runs all 18 benchmarks (14 ported synthetic + 4 real
+# functions extracted verbatim from Erlang/OTP).
 # asr_transform.beam must be built first since the _asr modules load it
 # as a parse_transform at their own compile time.
 set -euo pipefail
@@ -22,5 +23,9 @@ erlc -o "$OUT" -pa "$OUT" \
   bench_phase_plain.erl bench_phase_asr.erl bench_phase_counted.erl \
   bench_kalman_plain.erl bench_kalman_asr.erl bench_kalman_counted.erl \
   bench_twobody_plain.erl bench_twobody_asr.erl bench_twobody_counted.erl \
+  bench_xmlvsn_plain.erl bench_xmlvsn_asr.erl bench_xmlvsn_counted.erl \
+  bench_scansystemliteral_plain.erl bench_scansystemliteral_asr.erl bench_scansystemliteral_counted.erl \
+  bench_strip_plain.erl bench_strip_asr.erl bench_strip_counted.erl \
+  bench_validateheaders_plain.erl bench_validateheaders_asr.erl bench_validateheaders_counted.erl \
   run_all.erl
 erl -noshell -pa "$OUT" -eval "run_all:main(), init:stop()."

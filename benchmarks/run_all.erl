@@ -1,14 +1,18 @@
-%% Benchmark driver for all 14 ported benchmarks (Particle/Counter/Assoc
-%% from v1; Rotation/Biquad/Comoments/Lorenz/Mandelbrot/Projectile from
-%% v1.1 inlining; Bounce/Clamp/Phase from v1.3 branch-as-guarded-clauses;
-%% Kalman/Twobody from v1.2 multi-accumulator). Mirrors cpython-asr's
-%% harness.py protocol: correctness (baseline vs. transformed output,
-%% bit-identical) gates any timing report, and per-run allocation is
-%% measured via an explicit construction counter rather than a memory
-%% snapshot diff (Erlang's GC has the same allocator-slot-reuse pitfall
-%% documented in cpython-asr's own harness). Tags is a list since a
-%% multi-accumulator benchmark (Kalman) counts more than one record type,
-%% and Twobody's two accumulators share one record type/tag.
+%% Benchmark driver for all 18 benchmarks: 14 ported synthetic ones
+%% (Particle/Counter/Assoc from v1; Rotation/Biquad/Comoments/Lorenz/
+%% Mandelbrot/Projectile from v1.1 inlining; Bounce/Clamp/Phase from
+%% v1.3 branch-as-guarded-clauses; Kalman/Twobody from v1.2
+%% multi-accumulator), plus 4 real functions extracted verbatim from
+%% Erlang/OTP (XmlVsn/ScanSysLiteral/Strip from xmerl_scan.erl,
+%% ValidateHeaders from httpc.erl - the corpus study's own "unlocked
+%% loops," v1.6). Mirrors cpython-asr's harness.py protocol: correctness
+%% (baseline vs. transformed output, bit-identical) gates any timing
+%% report, and per-run allocation is measured via an explicit
+%% construction counter rather than a memory snapshot diff (Erlang's GC
+%% has the same allocator-slot-reuse pitfall documented in cpython-asr's
+%% own harness). Tags is a list since a multi-accumulator benchmark
+%% (Kalman) counts more than one record type, and Twobody's two
+%% accumulators share one record type/tag.
 -module(run_all).
 -export([main/0]).
 
@@ -29,7 +33,13 @@ main() ->
              {"Clamp",      bench_clamp_plain,      bench_clamp_asr,      bench_clamp_counted,      [point]},
              {"Phase",      bench_phase_plain,      bench_phase_asr,      bench_phase_counted,      [phase]},
              {"Kalman",     bench_kalman_plain,     bench_kalman_asr,     bench_kalman_counted,     [kstate, kcov]},
-             {"Twobody",    bench_twobody_plain,    bench_twobody_asr,    bench_twobody_counted,    [vec2]}],
+             {"Twobody",    bench_twobody_plain,    bench_twobody_asr,    bench_twobody_counted,    [vec2]},
+             {"XmlVsn",     bench_xmlvsn_plain,     bench_xmlvsn_asr,     bench_xmlvsn_counted,     [xmerlscanner]},
+             {"ScanSysLit", bench_scansystemliteral_plain, bench_scansystemliteral_asr,
+                            bench_scansystemliteral_counted, [xmerlscanner]},
+             {"Strip",      bench_strip_plain,      bench_strip_asr,      bench_strip_counted,      [xmerlscanner]},
+             {"ValidateHdr",bench_validateheaders_plain, bench_validateheaders_asr,
+                            bench_validateheaders_counted, [httprequesth]}],
     io:format("~-11s ~12s ~12s ~8s ~14s ~15s~n",
               ["Benchmark", "Base ms", "ASR ms", "Speedup", "Base constr", "ASR constr"]),
     io:format("~s~n", [lists:duplicate(76, $-)]),

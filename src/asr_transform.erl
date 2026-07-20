@@ -34,8 +34,25 @@
 %% is_ground_pattern/1); and an entry call's accumulator argument may be
 %% a bare variable or an update expression, not just a literal
 %% construction - fields are read directly off it instead
-%% (check_full_construction/5, splice_entry_args/3). See BEAM-asr design
-%% notes and README.md for the full qualification/rewrite spec.
+%% (check_full_construction/5, splice_entry_args/3). Benchmarking v1.6's
+%% own newly-qualifying real functions (benchmarks/README.md) as verbatim
+%% extractions from Erlang/OTP surfaced two further rewrite-correctness
+%% fixes those functions actually needed to compile, not just qualify:
+%% subst_bare_return/5 now reconstructs an update expression using the
+%% accumulator as its own base directly (matching
+%% collect_var_uses/3's own update-expression transparency), instead of
+%% falling through to generic recursion and replacing the base with a
+%% redundant full reconstruction; and a self-call to the qualifying
+%% function's own name/arity embedded inside a base clause's body (e.g.
+%% one branch of an intra-clause case that recurses, xmerl_scan.erl's
+%% xml_vsn/4) now gets its own accumulator argument spliced too, reusing
+%% splice_entry_args/3 (rewrite_clause_multi/3, rewrite_nonrecursive_multi/6
+%% - deliberately scoped to base clauses only, never recursive ones,
+%% since a recursive clause's own designated tail call is already
+%% rewritten by its own dedicated machinery and re-processing it
+%% generically is unsound whenever the accumulator's field count is 1,
+%% since old and new arity then coincide). See BEAM-asr design notes and
+%% README.md for the full qualification/rewrite spec.
 -module(asr_transform).
 -export([parse_transform/2]).
 
@@ -739,12 +756,35 @@ rename_vars(Term, _RenameMap) ->
 %% record construction built from the scalar variables. Classification
 %% already guarantees the only surviving bare occurrence (after
 %% subst_field_reads has consumed all field reads) is the intended return.
+%%
+%% v1.6: an update expression using VName as its own base
+%% (`VName#rec{field=Expr}`) is NOT such a bare return - per
+%% collect_var_uses/3's own update-expression-transparency case, it's a
+%% safe, meaningful use that computes a fresh value from VName's current
+%% fields, not "the accumulator handed back as-is." Falling through to
+%% the generic recursion below would still find and replace the nested
+%% `{var,_,VName}` (since that recursion doesn't know this base position
+%% is exempt), producing a technically-correct but redundant full
+%% reconstruction immediately overwritten by one field - and if this
+%% expression itself later needs splicing (e.g. an embedded self-call's
+%% own argument), that redundant reconstruction becomes VarName's own
+%% opaque "record" shape and defeats splicing entirely. Reconstructing
+%% directly here - explicit overrides as given, everything else read
+%% from the scalar map - produces the same value in one step, matching
+%% expand_field_exprs/5's own update-case template.
 subst_bare_return(Term, VName, RecName, Fields, ScalarMap) when is_tuple(Term) ->
     case Term of
         {var, VAnno, VName} ->
             {record, VAnno, RecName,
              [{record_field, VAnno, {atom, VAnno, F}, {var, VAnno, maps:get(F, ScalarMap)}}
               || F <- Fields]};
+        {record, Anno, {var, _, VName}, RecName2, FieldList} ->
+            FieldList2 = subst_bare_return(FieldList, VName, RecName, Fields, ScalarMap),
+            {record, Anno, RecName2,
+             [case find_field_expr(FieldList2, F) of
+                  {ok, Expr} -> {record_field, Anno, {atom, Anno, F}, Expr};
+                  error -> {record_field, Anno, {atom, Anno, F}, {var, Anno, maps:get(F, ScalarMap)}}
+              end || F <- Fields]};
         _ ->
             list_to_tuple([subst_bare_return(E, VName, RecName, Fields, ScalarMap)
                             || E <- tuple_to_list(Term)])
@@ -785,7 +825,24 @@ rewrite_top_function({function, Anno, Name, Arity, _Clauses}, PlanMap)
     Plan = maps:get({Name, Arity}, PlanMap),
     Accums = maps:get(accums, Plan),
     ZippedClausePlans = transpose([maps:get(clause_plans, AP) || AP <- Accums]),
-    NewClauses = [rewrite_clause_multi(CPGroup, Accums) || CPGroup <- ZippedClausePlans],
+    %% A self-call to Name/Arity can appear embedded inside a base
+    %% clause's own body - e.g. one branch of an intra-clause case that
+    %% recurses while another branch doesn't, so the clause's own
+    %% trailing form isn't a literal tail call and this position was
+    %% classified base, not recursive (xmerl_scan.erl's xml_vsn/4 has
+    %% exactly this shape). rewrite_nonrecursive_multi only substitutes
+    %% the accumulator's own occurrences there, not the shape of an
+    %% embedded call to this same function - so it still needs its own
+    %% accumulator argument spliced, exactly like a genuine external
+    %% entry call. Deliberately scoped to base clauses only (threaded
+    %% into rewrite_clause_multi/rewrite_nonrecursive_multi below), never
+    %% to recursive ones: a recursive clause's own designated tail call
+    %% is already correctly rewritten by its own dedicated machinery, and
+    %% when the accumulator's field count equals 1 the new arity equals
+    %% the old one, so an arg-count-based "already rewritten" guard can't
+    %% be relied on to avoid re-splicing that already-correct call.
+    SelfPlanMap = #{{Name, Arity} => Plan},
+    NewClauses = [rewrite_clause_multi(CPGroup, Accums, SelfPlanMap) || CPGroup <- ZippedClausePlans],
     {function, Anno, Name, new_arity(Plan), NewClauses};
 rewrite_top_function(Form, _PlanMap) ->
     Form.
@@ -886,7 +943,7 @@ entry_update_field_expr(FieldList, F, BaseVar, RecName) ->
 %% accumulators for a recursive clause; only base/unrelated can differ
 %% per accumulator within one non-recursive clause (e.g. one accumulator
 %% is read in the base case, a second is untouched there).
-rewrite_clause_multi(CPGroup, Accums) ->
+rewrite_clause_multi(CPGroup, Accums, SelfPlanMap) ->
     CP1 = hd(CPGroup),
     Anno = maps:get(anno, CP1),
     Patterns = maps:get(patterns, CP1),
@@ -895,11 +952,11 @@ rewrite_clause_multi(CPGroup, Accums) ->
     Pairs = lists:zip(CPGroup, Accums),
     case lists:any(fun(CP) -> maps:get(kind, CP) =:= recursive end, CPGroup) of
         true -> rewrite_recursive_multi(Pairs, Anno, Patterns, Guard0, Body0);
-        false -> rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0)
+        false -> rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0, SelfPlanMap)
     end.
 
-rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
-    {NewGuard0, NewBody} =
+rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0, SelfPlanMap) ->
+    {NewGuard0, NewBody0} =
         lists:foldl(
           fun({CP, AP}, {G, B}) ->
                   case maps:get(kind, CP) of
@@ -921,6 +978,11 @@ rewrite_nonrecursive_multi(Pairs, Anno, Patterns, Guard0, Body0) ->
     %% via ScalarMap) plus this added guard testing it against the
     %% literal - the field never needed a rename, just a constraint.
     NewGuard = append_guard_conjuncts(NewGuard0, guard_constraint_exprs(Pairs)),
+    %% A base clause's own trailing form is never a call to this same
+    %% function (that would have made it "recursive"), so there's no
+    %% already-rewritten tail call here to accidentally re-splice - safe
+    %% to apply unconditionally, unlike in a recursive clause's body.
+    NewBody = rewrite_entry_calls(NewBody0, SelfPlanMap),
     NewPatterns = splice_patterns_multi(Patterns, Pairs),
     {clause, Anno, NewPatterns, NewGuard, NewBody}.
 
